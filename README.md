@@ -1,5 +1,31 @@
 <!-- mcp-name: io.github.taylorwilsdon/workspace-mcp -->
 
+> [!IMPORTANT]
+> **This is a personal fork** of [taylorwilsdon/google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp), focused on **complete Gmail management**. Use branch [`gmail-total`](https://github.com/rylos/google_workspace_mcp/tree/gmail-total); everything else is unchanged upstream code, rebased on upstream releases.
+>
+> **What the fork adds over upstream (Gmail only):**
+>
+> | Area | Added | Tool |
+> |---|---|---|
+> | Drafts | list, update, delete, **send an existing draft by `draft_id`** (upstream PR [#1035](https://github.com/taylorwilsdon/google_workspace_mcp/pull/1035), merged here) | `draft_gmail_message(action=…)`, `send_gmail_message(draft_id=…)` |
+> | Search | search by **conversation**, with subject, participants, labels | `search_gmail_threads` |
+> | Labels | add/remove labels on **whole conversations** (archive, mark read) | `modify_gmail_thread_labels` |
+> | Trash | trash / untrash messages and conversations | `manage_gmail_trash` |
+> | Delete | **permanent** deletion, opt-in and only with `confirm_permanent=true` | `delete_gmail_permanently` |
+> | Filters | edit a filter (auto-label rule); **apply a filter to mail already in the mailbox**, with `dry_run` | `update_gmail_filter`, `apply_gmail_filter` |
+> | Settings | vacation auto-reply; Send-As aliases and signatures; forwarding addresses and auto-forwarding | `manage_gmail_vacation`, `manage_gmail_send_as`, `manage_gmail_forwarding` |
+>
+> New tools are in [`gmail/gmail_admin_tools.py`](gmail/gmail_admin_tools.py) (tests: [`tests/gmail/test_gmail_admin_tools.py`](tests/gmail/test_gmail_admin_tools.py)) and load with `--tool-tier complete`.
+>
+> **Scopes:** Gmail now also requests `gmail.settings.sharing` (forwarding, Send-As). Permanent deletion needs the full `https://mail.google.com/` scope and is enabled only with `WORKSPACE_MCP_GMAIL_PERMANENT_DELETE=1`; without it the tool is not registered and the scope is not requested.
+>
+> **Install:**
+> ```bash
+> uv tool install "git+https://github.com/rylos/google_workspace_mcp@gmail-total"
+> workspace-mcp --single-user --tools gmail --tool-tier complete
+> ```
+> Improvements are offered back upstream; when they land there, this fork goes away.
+
 <div align="center">
 
 # <span style="color:#cad8d9">Google Workspace MCP Server</span> <img src="https://github.com/user-attachments/assets/b89524e4-6e6e-49e6-ba77-00d6df0c6e5c" width="80" align="right" />
