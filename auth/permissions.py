@@ -23,6 +23,7 @@ from auth.scopes import (
     GMAIL_COMPOSE_SCOPE,
     GMAIL_SEND_SCOPE,
     GMAIL_SETTINGS_BASIC_SCOPE,
+    GMAIL_SETTINGS_SHARING_SCOPE,
     DRIVE_READONLY_SCOPE,
     DRIVE_FILE_SCOPE,
     DRIVE_SCOPE,
@@ -69,7 +70,7 @@ SERVICE_PERMISSION_LEVELS: Dict[str, List[Tuple[str, List[str]]]] = {
         ("organize", [GMAIL_LABELS_SCOPE, GMAIL_MODIFY_SCOPE]),
         ("drafts", [GMAIL_COMPOSE_SCOPE]),
         ("send", [GMAIL_SEND_SCOPE]),
-        ("full", [GMAIL_SETTINGS_BASIC_SCOPE]),
+        ("full", [GMAIL_SETTINGS_BASIC_SCOPE, GMAIL_SETTINGS_SHARING_SCOPE]),
     ],
     "drive": [
         ("readonly", [DRIVE_READONLY_SCOPE]),

@@ -5705,3 +5705,8 @@ async def batch_modify_gmail_message_labels(
         )
 
     return "\n".join(lines)
+
+
+# Mailbox administration tools (threads, trash, filters apply/update, vacation,
+# Send-As, forwarding) live in a separate module; importing registers them.
+from gmail import gmail_admin_tools  # noqa: E402,F401

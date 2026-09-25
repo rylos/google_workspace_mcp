@@ -19,6 +19,15 @@ gmail:
     - get_gmail_threads_content_batch
     - batch_modify_gmail_message_labels
     - start_google_auth
+    - search_gmail_threads
+    - modify_gmail_thread_labels
+    - manage_gmail_trash
+    - delete_gmail_permanently
+    - update_gmail_filter
+    - apply_gmail_filter
+    - manage_gmail_vacation
+    - manage_gmail_send_as
+    - manage_gmail_forwarding
 
 drive:
   core:

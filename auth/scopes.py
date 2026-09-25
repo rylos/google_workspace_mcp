@@ -6,6 +6,7 @@ Separated from service_decorator.py to avoid circular imports.
 """
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,22 @@ GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_LABELS_SCOPE = "https://www.googleapis.com/auth/gmail.labels"
 GMAIL_SETTINGS_BASIC_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic"
+# Forwarding addresses, auto-forwarding and Send-As aliases (create/delete/verify).
+GMAIL_SETTINGS_SHARING_SCOPE = "https://www.googleapis.com/auth/gmail.settings.sharing"
+# Full mailbox access: the only scope that allows PERMANENT deletion
+# (messages.delete / batchDelete, threads.delete). Requested only when
+# WORKSPACE_MCP_GMAIL_PERMANENT_DELETE=1.
+GMAIL_FULL_SCOPE = "https://mail.google.com/"
+
+
+def is_gmail_permanent_delete_enabled() -> bool:
+    """Whether permanent (non-trash) Gmail deletion is opted in."""
+    return os.getenv("WORKSPACE_MCP_GMAIL_PERMANENT_DELETE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
 
 # Google Chat API scopes
 CHAT_READONLY_SCOPE = "https://www.googleapis.com/auth/chat.messages.readonly"
@@ -92,6 +109,13 @@ SCRIPT_SCRIPTAPP_SCOPE = "https://www.googleapis.com/auth/script.scriptapp"
 # See https://developers.google.com/gmail/api/auth/scopes,
 # https://developers.google.com/drive/api/guides/api-specific-auth, etc.
 SCOPE_HIERARCHY = {
+    GMAIL_FULL_SCOPE: {
+        GMAIL_READONLY_SCOPE,
+        GMAIL_SEND_SCOPE,
+        GMAIL_COMPOSE_SCOPE,
+        GMAIL_MODIFY_SCOPE,
+        GMAIL_LABELS_SCOPE,
+    },
     GMAIL_MODIFY_SCOPE: {
         GMAIL_READONLY_SCOPE,
         GMAIL_SEND_SCOPE,
@@ -160,7 +184,10 @@ GMAIL_SCOPES = [
     GMAIL_MODIFY_SCOPE,
     GMAIL_LABELS_SCOPE,
     GMAIL_SETTINGS_BASIC_SCOPE,
+    GMAIL_SETTINGS_SHARING_SCOPE,
 ]
+if is_gmail_permanent_delete_enabled():
+    GMAIL_SCOPES.append(GMAIL_FULL_SCOPE)
 
 CHAT_SCOPES = [
     CHAT_READONLY_SCOPE,
