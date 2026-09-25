@@ -240,3 +240,66 @@ async def test_batch_modify_is_still_called_once_with_all_ids():
     service.users().messages().batchModify.assert_called_once_with(
         userId="me", body={"ids": ["msg-1", "msg-2"], "addLabelIds": ["TRASH"]}
     )
+
+
+# --- thread_ids ------------------------------------------------------------------
+
+
+def _http_error(status):
+    resp = Mock(status=status, reason="err")
+    return HttpError(resp, b"{}")
+
+
+@pytest.mark.asyncio
+async def test_thread_ids_use_threads_modify_and_report_per_thread():
+    service = Mock()
+
+    def thread_modify(**kwargs):
+        request = Mock()
+        if kwargs["id"] == "t-gone":
+            request.execute.side_effect = _http_error(404)
+        elif kwargs["id"] == "t-bad":
+            request.execute.side_effect = _http_error(500)
+        else:
+            request.execute.return_value = {"id": kwargs["id"]}
+        return request
+
+    service.users().threads().modify.side_effect = thread_modify
+    result = await _run(
+        service,
+        thread_ids=["t-ok", "t-gone", "t-bad"],
+        remove_label_ids=["INBOX"],
+    )
+
+    bodies = [
+        c.kwargs["body"]
+        for c in service.users().threads().modify.call_args_list
+        if "body" in c.kwargs
+    ]
+    assert bodies == [{"removeLabelIds": ["INBOX"]}] * 3
+    service.users().messages().batchModify.assert_not_called()
+    assert "Label changes for 3 thread ID(s): Removed labels: INBOX" in result
+    assert "Applied: 1/3" in result
+    assert "No such thread (1): t-gone" in result
+    assert "MESSAGE id where a THREAD id is required" in result
+    assert "Failed (1): t-bad (failed: HTTP 500)" in result
+
+
+@pytest.mark.asyncio
+async def test_message_and_thread_ids_can_be_combined():
+    service = _service({"msg-1": ["INBOX", "TRASH"]})
+    service.users().threads().modify.return_value.execute.return_value = {}
+    result = await _run(
+        service,
+        message_ids=["msg-1"],
+        thread_ids=["t-1"],
+        add_label_ids=["TRASH"],
+    )
+    assert "Label changes for 1 message ID(s)" in result
+    assert "Label changes for 1 thread ID(s)" in result
+
+
+@pytest.mark.asyncio
+async def test_requires_message_or_thread_ids():
+    with pytest.raises(Exception, match="message_ids or thread_ids"):
+        await _run(Mock(), add_label_ids=["TRASH"])
