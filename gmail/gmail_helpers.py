@@ -1066,6 +1066,7 @@ def filter_criteria_to_query(criteria: Mapping[str, Any]) -> str:
 
     Covers from, to, subject, query, negatedQuery, hasAttachment and size.
     ``excludeChats`` has no search operator and is ignored (callers report it).
+    Raises ValueError for ``size`` without an explicit ``sizeComparison``.
     """
     parts: List[str] = []
     if criteria.get("from"):
@@ -1081,7 +1082,12 @@ def filter_criteria_to_query(criteria: Mapping[str, Any]) -> str:
     if criteria.get("hasAttachment"):
         parts.append("has:attachment")
     if criteria.get("size"):
-        op = "larger" if criteria.get("sizeComparison") == "larger" else "smaller"
+        op = criteria.get("sizeComparison")
+        if op not in ("larger", "smaller"):
+            raise ValueError(
+                "size criteria need sizeComparison 'larger' or 'smaller' to be "
+                f"translated into a search query (got {op!r})"
+            )
         parts.append(f"{op}:{int(criteria['size'])}")
     return " ".join(parts)
 
@@ -1105,7 +1111,14 @@ async def update_gmail_filter(
         "action": dict(filter_action) if filter_action else old.get("action", {}),
     }
     created = await asyncio.to_thread(filters.create(userId="me", body=body).execute)
-    await asyncio.to_thread(filters.delete(userId="me", id=filter_id).execute)
+    try:
+        await asyncio.to_thread(filters.delete(userId="me", id=filter_id).execute)
+    except Exception as error:
+        raise ToolExecutionError(
+            f"Created the new filter {created.get('id', '(unknown)')} but could "
+            f"not delete the old filter {filter_id}: both are active now. "
+            f"Delete {filter_id} manually. Cause: {error}"
+        ) from error
     created.setdefault("criteria", body["criteria"])
     created.setdefault("action", body["action"])
     return old, created

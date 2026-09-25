@@ -8,6 +8,9 @@ from pydantic import TypeAdapter, ValidationError
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
+from fastmcp.exceptions import ToolError
+
+from auth.scopes import GMAIL_MODIFY_SCOPE, GMAIL_SETTINGS_BASIC_SCOPE
 from core.utils import JsonDict
 from gmail.gmail_helpers import filter_criteria_to_query
 from gmail.gmail_tools import manage_gmail_filter
@@ -141,6 +144,15 @@ def test_filter_criteria_to_query_empty():
     assert filter_criteria_to_query({}) == ""
 
 
+@pytest.mark.parametrize("comparison", [None, "unspecified"])
+def test_filter_criteria_to_query_rejects_size_without_comparison(comparison):
+    criteria = {"from": "a@b.com", "size": 1000}
+    if comparison:
+        criteria["sizeComparison"] = comparison
+    with pytest.raises(ValueError, match="sizeComparison"):
+        filter_criteria_to_query(criteria)
+
+
 @pytest.mark.asyncio
 async def test_update_creates_new_filter_before_deleting_old_and_keeps_criteria():
     mock_service = Mock()
@@ -182,6 +194,32 @@ async def test_update_creates_new_filter_before_deleting_old_and_keeps_criteria(
         ("delete", "old"),
     ]
     assert "New filter ID: new" in result
+
+
+@pytest.mark.asyncio
+async def test_update_reports_both_ids_when_old_filter_delete_fails():
+    mock_service = Mock()
+    filters = mock_service.users().settings().filters()
+    filters.get().execute.return_value = {
+        "id": "old",
+        "criteria": {"from": "a@b.com"},
+        "action": {"addLabelIds": ["L1"]},
+    }
+    filters.create().execute.return_value = {"id": "new"}
+    filters.delete().execute.side_effect = RuntimeError("backend error")
+
+    with pytest.raises(ToolError) as excinfo:
+        await _unwrap(manage_gmail_filter)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            action="update",
+            filter_id="old",
+            filter_action={"addLabelIds": ["L2"]},
+        )
+
+    message = str(excinfo.value)
+    assert "new" in message and "old" in message
+    assert "both are active" in message
 
 
 @pytest.mark.asyncio
@@ -293,3 +331,46 @@ async def test_apply_refuses_empty_query_and_missing_input():
             criteria={"excludeChats": True},
             filter_action={"addLabelIds": ["L"]},
         )
+
+
+def test_manage_gmail_filter_requires_only_settings_basic_scope():
+    assert manage_gmail_filter._required_google_scopes == [GMAIL_SETTINGS_BASIC_SCOPE]
+
+
+@pytest.mark.asyncio
+async def test_apply_refuses_token_without_modify_scope():
+    mock_service = Mock()
+    mock_service._http.credentials.scopes = [GMAIL_SETTINGS_BASIC_SCOPE]
+
+    with pytest.raises(ToolError, match="gmail.modify"):
+        await _unwrap(manage_gmail_filter)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            action="apply",
+            criteria={"from": "x@y.com"},
+            filter_action={"addLabelIds": ["L"]},
+        )
+    mock_service.users().messages().list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_runs_with_modify_scope():
+    mock_service = Mock()
+    mock_service._http.credentials.scopes = [
+        GMAIL_SETTINGS_BASIC_SCOPE,
+        GMAIL_MODIFY_SCOPE,
+    ]
+    mock_service.users().messages().list().execute.return_value = {
+        "messages": [{"id": "m1"}]
+    }
+
+    result = await _unwrap(manage_gmail_filter)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        action="apply",
+        criteria={"from": "x@y.com"},
+        filter_action={"addLabelIds": ["L"]},
+        dry_run=True,
+    )
+
+    assert "Matching messages: 1" in result

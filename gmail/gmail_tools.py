@@ -62,6 +62,7 @@ from auth.scopes import (
     GMAIL_COMPOSE_SCOPE,
     GMAIL_MODIFY_SCOPE,
     GMAIL_LABELS_SCOPE,
+    has_required_scopes,
 )
 from gmail.gmail_helpers import (
     GMAIL_METADATA_HEADERS,
@@ -4077,7 +4078,7 @@ async def list_gmail_filters(service, user_google_email: str) -> str:
     ),
 )
 @handle_http_errors("manage_gmail_filter", service_type="gmail")
-@require_google_service("gmail", ["gmail_settings_basic", GMAIL_MODIFY_SCOPE])
+@require_google_service("gmail", "gmail_settings_basic")
 async def manage_gmail_filter(
     service,
     user_google_email: str,
@@ -4099,6 +4100,7 @@ async def manage_gmail_filter(
       filter to matching conversations"). Use filter_id, or criteria +
       filter_action for an ad-hoc run. Forwarding is never applied. Use
       dry_run=true first to see the search query and the match count.
+      Needs the gmail.modify scope in addition to gmail.settings.basic.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -4170,6 +4172,18 @@ async def manage_gmail_filter(
             f"Action: {created.get('action') or '(none)'}"
         )
     elif action_lower == "apply":
+        # The decorator only asks for gmail.settings.basic, so create/delete/
+        # update keep working with a filters-only grant; apply also reads and
+        # relabels messages.
+        credentials = getattr(getattr(service, "_http", None), "credentials", None)
+        granted = getattr(credentials, "scopes", None)
+        if isinstance(granted, (list, tuple, set, frozenset)) and not (
+            has_required_scopes(granted, [GMAIL_MODIFY_SCOPE])
+        ):
+            raise ToolExecutionError(
+                "apply needs the gmail.modify scope to change existing messages; "
+                "re-authenticate with Gmail modify access."
+            )
         if filter_id:
             existing = await asyncio.to_thread(
                 service.users()
