@@ -15,12 +15,14 @@ import logging
 from datetime import date, datetime, time as dt_time
 from typing import Any, Dict, List, Literal, Optional
 
+from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from auth.scopes import GMAIL_MODIFY_SCOPE, is_gmail_permanent_delete_enabled
 from auth.service_decorator import require_google_service
 from core.server import server
 from core.utils import JsonDict, StringList, UserInputError, handle_http_errors
+from gmail.gmail_helpers import _fetch_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -190,13 +192,20 @@ async def modify_gmail_thread_labels(
 
     ok, failed = [], []
     for tid in thread_ids:
-        try:
-            await asyncio.to_thread(
-                service.users().threads().modify(userId="me", id=tid, body=body).execute
-            )
+        # Rate-limit and 5xx are retried with backoff (same labels twice = same
+        # result); anything else is reported for that thread and we keep going.
+        _, _, error = await _fetch_with_retry(
+            lambda t=tid: (
+                service.users().threads().modify(userId="me", id=t, body=body)
+            ),
+            tid,
+            "thread",
+            "modify_gmail_thread_labels",
+        )
+        if error is None:
             ok.append(tid)
-        except Exception as e:  # keep going, report per thread
-            failed.append(f"{tid}: {e}")
+        else:
+            failed.append(f"{tid}: {error}")
     lines = [f"Modified {len(ok)}/{len(thread_ids)} threads."]
     if add_label_ids:
         lines.append(f"Added: {', '.join(add_label_ids)}")
@@ -370,7 +379,11 @@ def filter_criteria_to_query(criteria: Dict[str, Any]) -> str:
     if criteria.get("hasAttachment"):
         parts.append("has:attachment")
     if criteria.get("size"):
-        op = "larger" if criteria.get("sizeComparison") == "larger" else "smaller"
+        op = criteria.get("sizeComparison")
+        if op not in ("larger", "smaller"):
+            raise UserInputError(
+                f"size criteria need sizeComparison 'larger' or 'smaller' (got {op!r})"
+            )
         parts.append(f"{op}:{int(criteria['size'])}")
     return " ".join(parts)
 
@@ -419,7 +432,14 @@ async def update_gmail_filter(
         "action": dict(filter_action) if filter_action else old.get("action", {}),
     }
     created = await asyncio.to_thread(filters.create(userId="me", body=body).execute)
-    await asyncio.to_thread(filters.delete(userId="me", id=filter_id).execute)
+    try:
+        await asyncio.to_thread(filters.delete(userId="me", id=filter_id).execute)
+    except Exception as error:
+        raise ToolError(
+            f"Created the new filter {created.get('id')} but could not delete the "
+            f"old filter {filter_id}: both are active now. Delete {filter_id} "
+            f"manually. Cause: {error}"
+        ) from error
     return (
         "Filter updated (recreated).\n"
         f"Old ID: {filter_id} (deleted)\n"

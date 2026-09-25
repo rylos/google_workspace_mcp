@@ -4,6 +4,8 @@ import sys
 from unittest.mock import MagicMock
 
 import pytest
+from fastmcp.exceptions import ToolError
+from googleapiclient.errors import HttpError
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -146,7 +148,58 @@ async def test_update_filter_creates_before_deleting_and_keeps_omitted_parts():
     assert "New ID: new" in out
 
 
+@pytest.mark.parametrize("comparison", [None, "unspecified"])
+def test_filter_criteria_to_query_rejects_size_without_comparison(comparison):
+    criteria = {"from": "a@b.it", "size": 1000}
+    if comparison:
+        criteria["sizeComparison"] = comparison
+    with pytest.raises(UserInputError, match="sizeComparison"):
+        filter_criteria_to_query(criteria)
+
+
+@pytest.mark.asyncio
+async def test_update_filter_names_both_ids_when_delete_fails():
+    svc = MagicMock()
+    filters = svc.users().settings().filters()
+    filters.get().execute.return_value = {"criteria": {"from": "a"}, "action": {}}
+    filters.create().execute.return_value = {"id": "new"}
+    filters.delete().execute.side_effect = RuntimeError("backend error")
+    with pytest.raises(ToolError, match="both are active") as excinfo:
+        await _unwrap(admin.update_gmail_filter)(
+            service=svc,
+            user_google_email=U,
+            filter_id="old",
+            filter_action={"addLabelIds": ["L2"]},
+        )
+    assert "new" in str(excinfo.value) and "old" in str(excinfo.value)
+
+
 # --- threads / trash ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_thread_labels_retry_rate_limit(monkeypatch):
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("gmail.gmail_helpers.asyncio.sleep", _no_sleep)
+    svc = MagicMock()
+    steps = [HttpError(MagicMock(status=429, reason="rate"), b"{}"), {}]
+
+    def _modify(**kw):
+        step = steps.pop(0)
+        req = MagicMock()
+        if isinstance(step, Exception):
+            req.execute.side_effect = step
+        else:
+            req.execute.return_value = step
+        return req
+
+    svc.users().threads().modify.side_effect = _modify
+    out = await _unwrap(admin.modify_gmail_thread_labels)(
+        service=svc, user_google_email=U, thread_ids=["t1"], add_label_ids=["L"]
+    )
+    assert "Modified 1/1 threads." in out
 
 
 @pytest.mark.asyncio
