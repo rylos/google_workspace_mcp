@@ -4395,9 +4395,18 @@ async def batch_modify_gmail_message_labels(
     if remove_label_ids:
         body["removeLabelIds"] = remove_label_ids
 
-    await asyncio.to_thread(
-        service.users().messages().batchModify(userId="me", body=body).execute
-    )
+    try:
+        await asyncio.to_thread(
+            service.users().messages().batchModify(userId="me", body=body).execute
+        )
+    except Exception as error:
+        if not thread_report:
+            raise
+        # The thread changes are already done: keep their report in the error.
+        raise ToolExecutionError(
+            f"Label change for message_ids failed: {error}\n\n"
+            f"The thread_ids part was already processed:\n{thread_report}"
+        ) from error
 
     actions = []
     if add_label_ids:

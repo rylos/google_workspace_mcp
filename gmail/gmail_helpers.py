@@ -1057,7 +1057,9 @@ async def modify_gmail_thread_labels(
     """Apply label changes to whole conversations with users.threads.modify.
 
     Unlike messages.batchModify, threads.modify answers per thread, so each
-    thread's outcome is known without a read-back. Returns
+    thread's outcome is known without a read-back. Rate-limit and 5xx errors
+    are retried with backoff; a thread that still fails does not stop the
+    others. Returns
     ``{thread_id: "applied" | "not_found" | "failed: <reason>"}``.
     """
     body: Dict[str, Any] = {}
@@ -1067,19 +1069,25 @@ async def modify_gmail_thread_labels(
         body["removeLabelIds"] = list(remove_label_ids)
     outcomes: Dict[str, str] = {}
     for thread_id in thread_ids:
-        try:
-            await asyncio.to_thread(
-                service.users()
-                .threads()
-                .modify(userId="me", id=thread_id, body=body)
-                .execute
-            )
+        # Setting the same labels twice gives the same result, so rate-limit and
+        # 5xx responses are safe to retry. Any other error, transport errors
+        # included, is recorded for that thread and the loop moves on.
+        _, _, error = await _fetch_with_retry(
+            lambda tid=thread_id: (
+                service.users().threads().modify(userId="me", id=tid, body=body)
+            ),
+            thread_id,
+            "thread",
+            "modify_gmail_thread_labels",
+        )
+        if error is None:
             outcomes[thread_id] = "applied"
-        except HttpError as error:
-            if _http_error_status(error) == 404:
-                outcomes[thread_id] = "not_found"
-            else:
-                outcomes[thread_id] = f"failed: HTTP {_http_error_status(error)}"
+        elif isinstance(error, HttpError) and _http_error_status(error) == 404:
+            outcomes[thread_id] = "not_found"
+        elif isinstance(error, HttpError):
+            outcomes[thread_id] = f"failed: HTTP {_http_error_status(error)}"
+        else:
+            outcomes[thread_id] = f"failed: {type(error).__name__}"
     return outcomes
 
 
