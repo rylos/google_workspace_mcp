@@ -9,11 +9,11 @@
 > |---|---|---|
 > | Drafts | list, update, delete, **send an existing draft by `draft_id`** (upstream PR [#1035](https://github.com/taylorwilsdon/google_workspace_mcp/pull/1035), merged here) | `draft_gmail_message(action=…)`, `send_gmail_message(draft_id=…)` |
 > | Search | search by **conversation**, with subject, participants, labels | `search_gmail_threads` |
-> | Labels | add/remove labels on **whole conversations** (archive, mark read) | `modify_gmail_thread_labels` |
 > | Trash | trash / untrash messages and conversations | `manage_gmail_trash` |
 > | Delete | **permanent** deletion, opt-in and only with `confirm_permanent=true` | `delete_gmail_permanently` |
-> | Filters | edit a filter (auto-label rule); **apply a filter to mail already in the mailbox**, with `dry_run` | `update_gmail_filter`, `apply_gmail_filter` |
 > | Settings | vacation auto-reply; Send-As aliases and signatures; forwarding addresses and auto-forwarding | `manage_gmail_vacation`, `manage_gmail_send_as`, `manage_gmail_forwarding` |
+>
+> Already accepted upstream and no longer in the fork: labels on whole conversations (`batch_modify_gmail_message_labels(thread_ids=…)`, [#1177](https://github.com/taylorwilsdon/google_workspace_mcp/pull/1177)) and filter update / apply to existing mail (`manage_gmail_filter(action="update"|"apply")`, [#1176](https://github.com/taylorwilsdon/google_workspace_mcp/pull/1176)).
 >
 > New tools are in [`gmail/gmail_admin_tools.py`](gmail/gmail_admin_tools.py) (tests: [`tests/gmail/test_gmail_admin_tools.py`](tests/gmail/test_gmail_admin_tools.py)) and load with `--tool-tier complete`.
 >

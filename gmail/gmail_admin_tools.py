@@ -2,9 +2,8 @@
 Gmail mailbox administration tools.
 
 Covers the parts of the Gmail API that gmail_tools.py does not expose:
-thread search and thread-level label changes, trash / untrash and (opt-in)
-permanent deletion, filter update and "apply filter to existing mail",
-vacation responder, Send-As aliases and signatures, forwarding.
+thread search, trash / untrash and (opt-in) permanent deletion, vacation
+responder, Send-As aliases and signatures, forwarding.
 
 Kept in a separate module so the fork diff against upstream gmail_tools.py
 stays small.
@@ -15,14 +14,12 @@ import logging
 from datetime import date, datetime, time as dt_time
 from typing import Any, Dict, List, Literal, Optional
 
-from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from auth.scopes import GMAIL_MODIFY_SCOPE, is_gmail_permanent_delete_enabled
 from auth.service_decorator import require_google_service
 from core.server import server
-from core.utils import JsonDict, StringList, UserInputError, handle_http_errors
-from gmail.gmail_helpers import _fetch_with_retry
+from core.utils import StringList, UserInputError, handle_http_errors
 
 logger = logging.getLogger(__name__)
 
@@ -143,77 +140,6 @@ async def search_gmail_threads(
         lines.append(f"     Link: https://mail.google.com/mail/u/0/#all/{tid}")
     if response.get("nextPageToken"):
         lines += ["", f"next_page_token: {response['nextPageToken']}"]
-    return "\n".join(lines)
-
-
-@server.tool(
-    title="Modify Gmail Thread Labels",
-    annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=True,
-        openWorldHint=True,
-    ),
-)
-@handle_http_errors("modify_gmail_thread_labels", service_type="gmail")
-@require_google_service("gmail", GMAIL_MODIFY_SCOPE)
-async def modify_gmail_thread_labels(
-    service,
-    user_google_email: str,
-    thread_ids: StringList,
-    add_label_ids: Optional[StringList] = None,
-    remove_label_ids: Optional[StringList] = None,
-) -> str:
-    """
-    Adds or removes labels on WHOLE conversations (every message in each thread).
-    Archive a conversation: remove_label_ids=["INBOX"]. Mark read: remove "UNREAD".
-    To trash conversations use manage_gmail_trash instead of the TRASH label.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        thread_ids (List[str]): Thread IDs to modify.
-        add_label_ids (Optional[List[str]]): Label IDs to add.
-        remove_label_ids (Optional[List[str]]): Label IDs to remove.
-
-    Returns:
-        str: Per-thread result.
-    """
-    if not thread_ids:
-        raise UserInputError("thread_ids must not be empty.")
-    if not add_label_ids and not remove_label_ids:
-        raise UserInputError(
-            "At least one of add_label_ids or remove_label_ids must be provided."
-        )
-    body: Dict[str, Any] = {}
-    if add_label_ids:
-        body["addLabelIds"] = list(add_label_ids)
-    if remove_label_ids:
-        body["removeLabelIds"] = list(remove_label_ids)
-
-    ok, failed = [], []
-    for tid in thread_ids:
-        # Rate-limit and 5xx are retried with backoff (same labels twice = same
-        # result); anything else is reported for that thread and we keep going.
-        _, _, error = await _fetch_with_retry(
-            lambda t=tid: (
-                service.users().threads().modify(userId="me", id=t, body=body)
-            ),
-            tid,
-            "thread",
-            "modify_gmail_thread_labels",
-        )
-        if error is None:
-            ok.append(tid)
-        else:
-            failed.append(f"{tid}: {error}")
-    lines = [f"Modified {len(ok)}/{len(thread_ids)} threads."]
-    if add_label_ids:
-        lines.append(f"Added: {', '.join(add_label_ids)}")
-    if remove_label_ids:
-        lines.append(f"Removed: {', '.join(remove_label_ids)}")
-    if failed:
-        lines.append("Failed:")
-        lines += [f"  - {f}" for f in failed]
     return "\n".join(lines)
 
 
@@ -351,209 +277,6 @@ if is_gmail_permanent_delete_enabled():
             lines.append("Failed:")
             lines += [f"  ✗ {f}" for f in failed]
         return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Filters: update and apply to existing mail
-# ---------------------------------------------------------------------------
-
-
-def _quote_term(value: str) -> str:
-    value = str(value).strip()
-    return f"({value})" if " " in value and not value.startswith("(") else value
-
-
-def filter_criteria_to_query(criteria: Dict[str, Any]) -> str:
-    """Translate Gmail filter criteria into an equivalent search query."""
-    parts: List[str] = []
-    if criteria.get("from"):
-        parts.append(f"from:{_quote_term(criteria['from'])}")
-    if criteria.get("to"):
-        parts.append(f"to:{_quote_term(criteria['to'])}")
-    if criteria.get("subject"):
-        parts.append(f"subject:{_quote_term(criteria['subject'])}")
-    if criteria.get("query"):
-        parts.append(f"({criteria['query']})")
-    if criteria.get("negatedQuery"):
-        parts.append(f"-({criteria['negatedQuery']})")
-    if criteria.get("hasAttachment"):
-        parts.append("has:attachment")
-    if criteria.get("size"):
-        op = criteria.get("sizeComparison")
-        if op not in ("larger", "smaller"):
-            raise UserInputError(
-                f"size criteria need sizeComparison 'larger' or 'smaller' (got {op!r})"
-            )
-        parts.append(f"{op}:{int(criteria['size'])}")
-    return " ".join(parts)
-
-
-@server.tool(
-    title="Update Gmail Filter",
-    annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=False,
-        openWorldHint=True,
-    ),
-)
-@handle_http_errors("update_gmail_filter", service_type="gmail")
-@require_google_service("gmail", "gmail_settings_basic")
-async def update_gmail_filter(
-    service,
-    user_google_email: str,
-    filter_id: str,
-    criteria: Optional[JsonDict] = None,
-    filter_action: Optional[JsonDict] = None,
-) -> str:
-    """
-    Changes an existing filter (auto-label rule). Gmail has no filter update API,
-    so this creates the new filter FIRST and then deletes the old one: the filter
-    ID changes. Fields you omit are kept from the old filter; pass a whole
-    criteria or filter_action object to replace that part.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        filter_id (str): ID of the filter to change.
-        criteria (Optional[Dict]): New criteria (from, to, subject, query,
-            negatedQuery, hasAttachment, excludeChats, size, sizeComparison).
-        filter_action (Optional[Dict]): New action (addLabelIds, removeLabelIds,
-            forward).
-
-    Returns:
-        str: Old and new filter.
-    """
-    if not criteria and not filter_action:
-        raise UserInputError("Provide criteria and/or filter_action to change.")
-    filters = service.users().settings().filters()
-    old = await asyncio.to_thread(filters.get(userId="me", id=filter_id).execute)
-    body = {
-        "criteria": dict(criteria) if criteria else old.get("criteria", {}),
-        "action": dict(filter_action) if filter_action else old.get("action", {}),
-    }
-    created = await asyncio.to_thread(filters.create(userId="me", body=body).execute)
-    try:
-        await asyncio.to_thread(filters.delete(userId="me", id=filter_id).execute)
-    except Exception as error:
-        raise ToolError(
-            f"Created the new filter {created.get('id')} but could not delete the "
-            f"old filter {filter_id}: both are active now. Delete {filter_id} "
-            f"manually. Cause: {error}"
-        ) from error
-    return (
-        "Filter updated (recreated).\n"
-        f"Old ID: {filter_id} (deleted)\n"
-        f"New ID: {created.get('id')}\n"
-        f"Criteria: {created.get('criteria', body['criteria'])}\n"
-        f"Action: {created.get('action', body['action'])}"
-    )
-
-
-@server.tool(
-    title="Apply Gmail Filter To Existing Mail",
-    annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=True,
-        openWorldHint=True,
-    ),
-)
-@handle_http_errors("apply_gmail_filter", service_type="gmail")
-@require_google_service("gmail", ["gmail_settings_basic", GMAIL_MODIFY_SCOPE])
-async def apply_gmail_filter(
-    service,
-    user_google_email: str,
-    filter_id: Optional[str] = None,
-    criteria: Optional[JsonDict] = None,
-    filter_action: Optional[JsonDict] = None,
-    dry_run: bool = False,
-    max_messages: int = 5000,
-) -> str:
-    """
-    Applies a filter's label actions to mail ALREADY in the mailbox (Gmail only
-    applies filters to new mail; this is the web UI's "also apply to matching
-    conversations"). Uses an existing filter_id, or ad-hoc criteria +
-    filter_action. Forwarding is never applied retroactively.
-    Use dry_run=true first to see the query and how many messages match.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        filter_id (Optional[str]): Existing filter to apply.
-        criteria (Optional[Dict]): Criteria, if no filter_id.
-        filter_action (Optional[Dict]): Action (addLabelIds/removeLabelIds), if no filter_id.
-        dry_run (bool): Only count matches, change nothing.
-        max_messages (int): Safety cap on messages changed (default 5000).
-
-    Returns:
-        str: Query used, matches, labels applied.
-    """
-    if filter_id:
-        f = await asyncio.to_thread(
-            service.users().settings().filters().get(userId="me", id=filter_id).execute
-        )
-        criteria, filter_action = f.get("criteria", {}), f.get("action", {})
-    if not criteria or not filter_action:
-        raise UserInputError("Provide filter_id, or both criteria and filter_action.")
-
-    query = filter_criteria_to_query(criteria)
-    if not query:
-        raise UserInputError("Filter criteria produce an empty query; refusing.")
-    add = list(filter_action.get("addLabelIds") or [])
-    remove = list(filter_action.get("removeLabelIds") or [])
-    notes = []
-    if filter_action.get("forward"):
-        notes.append("Forwarding is not applied to existing mail.")
-    if criteria.get("excludeChats"):
-        notes.append("excludeChats has no search equivalent and was ignored.")
-
-    ids: List[str] = []
-    page_token = None
-    while len(ids) < max_messages:
-        params = {"userId": "me", "q": query, "maxResults": 500}
-        if page_token:
-            params["pageToken"] = page_token
-        resp = await asyncio.to_thread(
-            service.users().messages().list(**params).execute
-        )
-        ids += [m["id"] for m in resp.get("messages") or []]
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    truncated = len(ids) > max_messages or bool(page_token)
-    ids = ids[:max_messages]
-
-    lines = [
-        f"Query: {query}",
-        f"Matching messages: {len(ids)}{'+' if truncated else ''}",
-    ]
-    if add:
-        lines.append(f"Add labels: {', '.join(add)}")
-    if remove:
-        lines.append(f"Remove labels: {', '.join(remove)}")
-    lines += notes
-    if dry_run:
-        lines.insert(0, "DRY RUN — nothing changed.")
-        return "\n".join(lines)
-    if not add and not remove:
-        lines.insert(0, "Nothing to apply: the filter has no label actions.")
-        return "\n".join(lines)
-
-    body: Dict[str, Any] = {}
-    if add:
-        body["addLabelIds"] = add
-    if remove:
-        body["removeLabelIds"] = remove
-    for chunk in _chunks(ids):
-        await asyncio.to_thread(
-            service.users()
-            .messages()
-            .batchModify(userId="me", body={"ids": chunk, **body})
-            .execute
-        )
-    lines.insert(0, f"Applied to {len(ids)} messages.")
-    if truncated:
-        lines.append(f"Stopped at max_messages={max_messages}; run again for the rest.")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
