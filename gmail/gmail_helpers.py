@@ -6,6 +6,7 @@ import asyncio
 import html
 import logging
 import re
+import secrets
 import ssl
 from collections import Counter
 from datetime import datetime, timezone
@@ -13,8 +14,11 @@ from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional
 
+import httplib2
 from fastmcp.exceptions import ToolError as ToolExecutionError
 from googleapiclient.errors import HttpError
+
+from core.utils import UserInputError
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +234,11 @@ def _normalize_email(address: str) -> str:
     return f"{local}@{domain}"
 
 
+def _new_attachment_id() -> str:
+    """Return a random attachment id in the shape Gmail web uses (``f_...``)."""
+    return f"f_{secrets.token_hex(5)}"
+
+
 def _http_error_status(error: HttpError) -> Optional[int]:
     status = getattr(getattr(error, "resp", None), "status", None)
     try:
@@ -305,6 +314,28 @@ async def _fetch_with_retry(
 
     logger.error(f"[{log_prefix}] Failed to fetch {item_label} {item_id}: {last_error}")
     return item_id, None, last_error
+
+
+async def send_message_once(service, send_body: Dict[str, Any]) -> Dict[str, Any]:
+    """Send a message without retries, flagging failures that may have delivered it."""
+    try:
+        return await asyncio.to_thread(
+            service.users().messages().send(userId="me", body=send_body).execute,
+            num_retries=0,
+        )
+    except (
+        HttpError,
+        httplib2.HttpLib2ErrorWithResponse,
+        ssl.SSLError,
+        TimeoutError,
+        ConnectionError,
+    ) as error:
+        if isinstance(error, HttpError) and (_http_error_status(error) or 0) < 500:
+            raise
+        raise ToolExecutionError(
+            f"Gmail send failed with an ambiguous error ({error}), so the message "
+            "may already have been delivered. Check the Sent folder before sending again."
+        ) from error
 
 
 def _retryable_result_ids(
@@ -878,6 +909,30 @@ _HTML_TAG_RE = re.compile(
 # would corrupt CSS/JS or show up literally.
 _HTML_RAW_TEXT_RE = re.compile(r"<\s*(?:pre|style|script|textarea)\b", re.IGNORECASE)
 _NEWLINE_RUN_RE = re.compile(r"((?:\r?\n)+)")
+_ESCAPED_LT = r"&(?:lt|#0*60|#x0*3c);"
+_ESCAPED_GT = r"&(?:gt|#0*62|#x0*3e);"
+# Non-space attribute start avoids quadratic backtracking against \s+.
+_ESCAPED_HTML_OPENING_TAG_RE = re.compile(
+    rf"^\s*{_ESCAPED_LT}\s*[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>\s][^<>]*|\s*(?:/\s*)?)(?:>|{_ESCAPED_GT})",
+    re.IGNORECASE,
+)
+_RAW_HTML_TAG_RE = re.compile(r"<\s*/?\s*[A-Za-z][A-Za-z0-9-]*(?:\s|/|>)")
+
+
+def _reject_entity_escaped_html_body(
+    body: Optional[str], body_format: Literal["plain", "html"]
+) -> None:
+    """Reject an html body that opens with an escaped tag and contains no real tag."""
+    if not body or body_format != "html":
+        return
+    if not _ESCAPED_HTML_OPENING_TAG_RE.match(body) or _RAW_HTML_TAG_RE.search(body):
+        return
+    raise UserInputError(
+        "body_format='html' but the body's markup is HTML-entity-escaped "
+        "(e.g. '&lt;div&gt;'), so the recipient would see the tags as literal "
+        "text. Resend with real markup such as '<div>'. To show escaped text "
+        "on purpose, wrap the body in a real tag such as '<p>...</p>'."
+    )
 
 
 def html_newlines_to_br(html_body: str) -> str:
@@ -996,40 +1051,49 @@ def _find_send_as_entry(
     )
 
 
-async def _get_send_as_signature_html(service, from_email: Optional[str] = None) -> str:
-    """
-    Fetch signature HTML from Gmail send-as settings.
-
-    Returns empty string when the account has no signature configured or when
-    auth/scope errors mean the settings endpoint is unavailable.
-    """
-    send_as_entries = await _get_send_as_entries(service)
-    if not send_as_entries:
-        return ""
-
-    if from_email:
-        entry = _find_send_as_entry(send_as_entries, from_email)
-        if entry:
-            return entry.get("signature", "") or ""
-
-    for entry in send_as_entries:
-        if entry.get("isPrimary"):
-            return entry.get("signature", "") or ""
-
-    return send_as_entries[0].get("signature", "") or ""
+def _send_as_entry_is_usable(entry: Dict[str, Any]) -> bool:
+    """True unless Gmail reports this send-as entry as pending verification."""
+    return entry.get("verificationStatus") != "pending"
 
 
 async def _get_send_as_identity_and_signature(
     service,
     from_email: Optional[str],
     fallback_email: str,
-) -> tuple[str, str]:
-    """Resolve the requested or default Gmail send-as identity and signature."""
+    require_match: bool = True,
+) -> tuple[str, str, str]:
+    """Resolve (sender_email, display_name, signature_html) for a send-as identity.
+
+    With require_match, raises when from_email is not a usable send-as address,
+    since Gmail would silently send from the default address instead; without
+    it, an unlisted from_email takes the primary entry's signature. Validation
+    is skipped when the send-as list is unreadable.
+    """
     send_as_entries = await _get_send_as_entries(service)
     selected_entry = None
 
     if from_email:
+        if not send_as_entries:
+            return from_email, "", ""
         selected_entry = _find_send_as_entry(send_as_entries, from_email)
+        if not require_match:
+            selected_entry = selected_entry or next(
+                (entry for entry in send_as_entries if entry.get("isPrimary")),
+                send_as_entries[0],
+            )
+        elif selected_entry is None or not _send_as_entry_is_usable(selected_entry):
+            accepted = [
+                entry.get("sendAsEmail", "")
+                for entry in send_as_entries
+                if _send_as_entry_is_usable(entry)
+            ]
+            raise ToolExecutionError(
+                f"'{from_email}' is not an accepted 'Send mail as' address for this "
+                f"mailbox, and Gmail would silently send from the default address "
+                f"instead. Accepted: {', '.join(accepted) or '(none)'}. Add the "
+                f"address under Gmail Settings > Accounts > Send mail as, or omit "
+                f"from_email to use the default sender."
+            )
     else:
         selected_entry = next(
             (entry for entry in send_as_entries if entry.get("isDefault")), None
@@ -1042,20 +1106,86 @@ async def _get_send_as_identity_and_signature(
             selected_entry = send_as_entries[0]
 
     sender_email = from_email or fallback_email
+    display_name = ""
     signature_html = ""
     if selected_entry:
         if not from_email:
             sender_email = selected_entry.get("sendAsEmail") or fallback_email
+        display_name = (selected_entry.get("displayName") or "").strip()
         signature_html = selected_entry.get("signature", "") or ""
 
-    return sender_email, signature_html
+    return sender_email, display_name, signature_html
 
 
-async def _get_send_as_signature_html_for_tool(
-    service, from_email: Optional[str] = None
+async def modify_gmail_thread_labels(
+    service,
+    thread_ids: Iterable[str],
+    add_label_ids: Optional[List[str]] = None,
+    remove_label_ids: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """Apply label changes to whole threads, retrying transient errors per thread.
+
+    Returns ``{thread_id: "applied" | "not_found" | "failed: <reason>"}``.
+    """
+    body: Dict[str, Any] = {}
+    if add_label_ids:
+        body["addLabelIds"] = list(add_label_ids)
+    if remove_label_ids:
+        body["removeLabelIds"] = list(remove_label_ids)
+    outcomes: Dict[str, str] = {}
+    for thread_id in thread_ids:
+        _, _, error = await _fetch_with_retry(
+            lambda tid=thread_id: (
+                service.users().threads().modify(userId="me", id=tid, body=body)
+            ),
+            thread_id,
+            "thread",
+            "modify_gmail_thread_labels",
+        )
+        if error is None:
+            outcomes[thread_id] = "applied"
+        elif isinstance(error, HttpError) and _http_error_status(error) == 404:
+            outcomes[thread_id] = "not_found"
+        elif isinstance(error, HttpError):
+            outcomes[thread_id] = (
+                f"failed: HTTP {_http_error_status(error)} {error.reason}"
+            )
+        else:
+            outcomes[thread_id] = f"failed: {type(error).__name__}"
+    return outcomes
+
+
+def _format_id_list(ids: List[str], limit: int = 10) -> str:
+    """Join IDs for a result message, truncating very long lists."""
+    shown = ", ".join(ids[:limit])
+    if len(ids) > limit:
+        shown += f", … (+{len(ids) - limit} more)"
+    return shown
+
+
+def format_thread_label_outcomes(
+    thread_ids: List[str], outcomes: Dict[str, str], action_summary: str
 ) -> str:
-    """Fetch signature HTML and convert non-benign failures to tool errors."""
-    return await _get_send_as_signature_html(service, from_email=from_email)
+    """Summarise per-thread results of a thread-level label change."""
+    applied = [t for t in thread_ids if outcomes.get(t) == "applied"]
+    missing = [t for t in thread_ids if outcomes.get(t) == "not_found"]
+    failed = [
+        f"{t} ({outcomes[t]})"
+        for t in thread_ids
+        if outcomes.get(t, "").startswith("failed")
+    ]
+    lines = [
+        f"Label changes for {len(thread_ids)} thread ID(s): {action_summary}",
+        f"Applied: {len(applied)}/{len(thread_ids)}",
+    ]
+    if missing:
+        lines.append(
+            f"No such thread ({len(missing)}): {_format_id_list(missing)}\n"
+            "  One possible cause is passing a MESSAGE id where a THREAD id is required."
+        )
+    if failed:
+        lines.append(f"Failed ({len(failed)}): {_format_id_list(failed)}")
+    return "\n".join(lines)
 
 
 # users.messages.batchModify accepts at most 1000 IDs per call.

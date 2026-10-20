@@ -35,6 +35,7 @@ from core.file_limits import (
     ensure_within_file_size_limit,
     get_stateless_inline_max_bytes,
 )
+from core.gcs_attachment_storage import gcs_files_enabled
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     IMAGE_MIME_TYPES,
@@ -44,6 +45,7 @@ from core.utils import (
     encode_image_content,
     OfficeXmlExtractionError,
     OfficeXmlTooLargeError,
+    UserInputError,
     extract_office_xml_text,
     extract_pdf_text,
     handle_http_errors,
@@ -86,11 +88,13 @@ from gdrive.drive_helpers import (
     has_explicit_trashed_clause,
     initiate_resumable_upload_session,
     native_replace_format_map,
+    normalize_drive_query_v2_compat,
     reject_sources_with_upload_url,
     resolve_drive_item,
     resolve_file_type_mime,
     resolve_folder_id,
     resumable_upload_result,
+    upload_url_hint,
     upload_url_not_offered_error,
     validate_expiration_time,
     validate_share_role,
@@ -209,13 +213,15 @@ async def search_drive_files(
     is_structured_query = any(pattern.search(query) for pattern in DRIVE_QUERY_PATTERNS)
 
     if is_structured_query:
-        final_query = query
-        logger.debug(
-            f"[search_drive_files] Using structured query as-is: '{final_query}'"
-        )
+        final_query = normalize_drive_query_v2_compat(query)
+        if final_query != query:
+            logger.info(
+                "[search_drive_files] Normalized v2 query field names to v3 equivalents"
+            )
+        logger.debug(f"[search_drive_files] Using structured query: '{final_query}'")
     else:
         # For free text queries, wrap in fullText contains
-        escaped_query = query.replace("'", "\\'")
+        escaped_query = query.replace("\\", "\\\\").replace("'", "\\'")
         final_query = f"fullText contains '{escaped_query}'"
         logger.debug(
             f"[search_drive_files] Reformatting free text query '{query}' to '{final_query}'"
@@ -557,7 +563,12 @@ async def get_drive_file_download_url(
 
     # Stateless mode has no attachment storage to hand out a URL from, so the
     # file itself goes back as an embedded resource, up to inline_max_bytes.
-    inline_max_bytes = get_stateless_inline_max_bytes() if is_stateless_mode() else None
+    # GCS staging supplies that storage, so the file goes there instead.
+    inline_max_bytes = (
+        get_stateless_inline_max_bytes()
+        if is_stateless_mode() and not gcs_files_enabled()
+        else None
+    )
     if inline_max_bytes == 0:
         return _stateless_inline_disabled_message(file_name, file_id, output_mime_type)
     # Drive's declared size is the download size only for binary files; an
@@ -648,7 +659,7 @@ async def get_drive_file_download_url(
                 "\nThe file has been saved to disk and can be accessed directly via the file path."
             )
         else:
-            download_url = get_attachment_url(result.file_id)
+            download_url = await asyncio.to_thread(get_attachment_url, result.file_id)
             result_lines.append(f"\n📎 Download URL: {download_url}")
             result_lines.append("\nThe file will expire after 1 hour.")
 
@@ -890,6 +901,8 @@ async def create_drive_file(
     """
     Creates a new file in Google Drive, supporting creation within shared drives.
     Accepts direct text content, inline base64 bytes, or a fileUrl to fetch content from.
+    Where local file access is disabled it can instead return an upload URL for the
+    caller to PUT file bytes to.
     This stores the supplied bytes without converting them to Google Docs, Sheets, or
     Slides. Use the matching import_to_google_* tool for Google-native conversion.
 
@@ -899,7 +912,7 @@ async def create_drive_file(
         content (Optional[str]): If provided, the content to write to the file.
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
         mime_type (Optional[str]): The MIME type of the file. Defaults to 'text/plain'; required with return_upload_url.
-        fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
+        fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports http:// and https://; file:// only where local file access is enabled. Where it is disabled, files on the caller's machine go through an upload URL instead (see the upload-URL parameter, if offered).
         base64_content (Optional[str]): Standard base64-encoded file bytes.
         content_mime_type (Optional[str]): MIME type for base64_content uploads.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
@@ -1047,6 +1060,14 @@ async def create_drive_file(
         # Check if this is a file:// URL
         parsed_url = urlparse(fileUrl)
         if parsed_url.scheme == "file":
+            if not local_file_access_enabled():
+                raise UserInputError(
+                    "Local file access is disabled on this server: file paths "
+                    "resolve on the server's filesystem, not the caller's. "
+                    "Provide the file by http(s) URL or as inline content "
+                    f"instead. {upload_url_hint('mime_type')}"
+                )
+
             # Handle file:// URL - read from local filesystem
             logger.info(
                 "[create_drive_file] Detected file:// URL, reading from local filesystem"
@@ -1128,7 +1149,7 @@ async def create_drive_file(
                         await asyncio.to_thread(spool.write, chunk)
 
                     _total, content_type = await _stream_url_with_validation(
-                        fileUrl, _write_spool
+                        fileUrl, _write_spool, upload_type_param="mime_type"
                     )
                     await asyncio.to_thread(spool.seek, 0)
 
@@ -1166,7 +1187,7 @@ async def create_drive_file(
                         await asyncio.to_thread(temp_file.write, chunk)
 
                     total_bytes, content_type = await _stream_url_with_validation(
-                        fileUrl, _write_chunk
+                        fileUrl, _write_chunk, upload_type_param="mime_type"
                     )
 
                     logger.info(
@@ -1273,7 +1294,7 @@ async def import_to_google_doc(
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        file_name (str): The name for the new Google Doc (extension will be ignored).
+        file_name (str): The name for the new Google Doc; the extension is dropped from the title. Without 'source_format', its extension also sets the format of 'content' or 'base64_content' (e.g. 'Notes.md' so Markdown tables are not imported as plain text).
         content (Optional[str]): Text content for text-based formats. Use only for short snippets or content already in memory.
         file_path (Optional[str]): Local file path or file:// URL for any supported format (MD, TXT, HTML, DOCX, ODT, RTF). Appropriate for larger files than content, but file_path may still load the file into memory or perform non-streaming reads. Avoid very large files that could exceed memory or time limits; use streaming/chunked uploads or an alternative API for huge files.
         file_url (Optional[str]): Remote URL to fetch the file from (http/https).
@@ -1359,7 +1380,7 @@ async def import_to_google_slides(
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        file_name (str): The name for the new Google Slides presentation (extension will be ignored).
+        file_name (str): The name for the new Google Slides presentation; the extension is dropped from the title. Without 'source_format', its extension also sets the format of 'base64_content' (e.g. 'Deck.pptx').
         file_path (Optional[str]): Local file path or file:// URL for any supported format (PPTX, PPT, ODP). Appropriate for larger files than content, but file_path may still load the file into memory or perform non-streaming reads. Avoid very large files that could exceed memory or time limits; use streaming/chunked uploads or an alternative API for huge files.
         file_url (Optional[str]): Remote URL to fetch the presentation from (http/https).
         source_format (Optional[str]): Source format hint ('pptx', 'ppt', 'odp').
@@ -1440,7 +1461,7 @@ async def import_to_google_sheets(
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        file_name (str): The name for the new Google Sheets spreadsheet (extension will be ignored).
+        file_name (str): The name for the new Google Sheets spreadsheet; the extension is dropped from the title. Without 'source_format', its extension also sets the format of 'content' or 'base64_content' (e.g. 'Data.csv').
         content (Optional[str]): Text content for text-based formats (CSV, TSV). Use only for short snippets or content already in memory.
         file_path (Optional[str]): Local file path or file:// URL for any supported format (XLSX, XLS, ODS, CSV, TSV). Appropriate for larger files than content, but file_path may still load the file into memory or perform non-streaming reads. Avoid very large files that could exceed memory or time limits; use streaming/chunked uploads or an alternative API for huge files.
         file_url (Optional[str]): Remote URL to fetch the spreadsheet from (http/https).
@@ -2109,6 +2130,7 @@ async def update_drive_file(
                     if format_map
                     else (target_mime_type or "application/octet-stream")
                 ),
+                upload_type_param="mime_type",
             )
             query_params["media_body"] = media
 
@@ -2659,6 +2681,7 @@ async def copy_drive_file(
     file_id: str,
     new_name: Optional[str] = None,
     parent_folder_id: str = "root",
+    copy_comments: bool = False,
 ) -> str:
     """
     Creates a copy of an existing Google Drive file.
@@ -2671,6 +2694,7 @@ async def copy_drive_file(
         file_id (str): The ID of the file to copy. Required.
         new_name (Optional[str]): New name for the copied file. If not provided, uses "Copy of [original name]".
         parent_folder_id (str): The ID of the folder where the copy should be created. Defaults to 'root' (My Drive).
+        copy_comments (bool): Copy open comments and suggestions (Docs/Sheets/Slides only). Defaults to False.
 
     Returns:
         str: Confirmation message with details of the copied file and its link.
@@ -2702,6 +2726,7 @@ async def copy_drive_file(
             fileId=file_id,
             body=copy_body,
             supportsAllDrives=True,
+            copyComments=copy_comments,
             fields="id, name, webViewLink, mimeType, parents",
         )
         .execute
@@ -2826,19 +2851,9 @@ async def set_drive_file_permissions(
     # Handle link sharing via permissions API
     if link_sharing is not None:
         current_permissions = await asyncio.to_thread(
-            service.permissions()
-            .list(
-                fileId=file_id,
-                supportsAllDrives=True,
-                fields="permissions(id, type, role)",
-            )
-            .execute
+            list_all_permissions, service, file_id
         )
-        anyone_perms = [
-            p
-            for p in current_permissions.get("permissions", [])
-            if p.get("type") == "anyone"
-        ]
+        anyone_perms = [p for p in current_permissions if p.get("type") == "anyone"]
 
         if link_sharing == "off":
             if anyone_perms:

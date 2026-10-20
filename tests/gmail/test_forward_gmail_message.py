@@ -11,6 +11,8 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
+from fastmcp.exceptions import ToolError
+
 from gmail.gmail_tools import _forward_gmail_message_impl, draft_gmail_message
 from core.utils import UserInputError
 
@@ -181,6 +183,9 @@ async def test_forward_simple_text_email():
     assert "Email forwarded" in result
     assert "fwd001" in result
     mock_service.users().messages().send.assert_called()
+    mock_service.users().messages().send.return_value.execute.assert_called_once_with(
+        num_retries=0
+    )
 
     sent = get_sent_mime_message(mock_service)
     assert sent["Subject"] == "Fwd: Hello"
@@ -346,6 +351,28 @@ async def test_draft_forward_plus_explicit_attachment_counts_both():
     _, attachments = get_body_and_attachments(drafted)
     names = sorted(a.get_filename() for a in attachments)
     assert names == ["note.txt", "report.pdf"]  # both, no partial-failure error
+
+
+@pytest.mark.asyncio
+async def test_forward_reports_unknown_delivery_on_ambiguous_failure():
+    message = create_mock_message(
+        subject="Hello",
+        from_addr="alice@example.com",
+        to_addr="bob@example.com",
+        text_body="This is the body.",
+    )
+    mock_service = create_mock_service(message)
+    mock_service.users().messages().send().execute.side_effect = ConnectionResetError(
+        "reset by peer"
+    )
+
+    with pytest.raises(ToolError, match="Check the Sent folder before sending again"):
+        await _forward_gmail_message_impl(
+            service=mock_service,
+            message_id="msg123",
+            to="recipient@example.com",
+            user_google_email="me@example.com",
+        )
 
 
 @pytest.mark.asyncio
@@ -717,3 +744,46 @@ async def test_forward_subject_override():
 
     sent = get_sent_mime_message(mock_service)
     assert sent["Subject"] == "Custom Subject"
+
+
+@pytest.mark.asyncio
+async def test_forward_as_draft_keeps_attachments_and_does_not_send():
+    """A forward draft keeps the attachments and is saved without being sent."""
+    message = create_mock_message(
+        subject="Quarterly",
+        from_addr="alice@example.com",
+        to_addr="bob@example.com",
+        text_body="See attached.",
+        attachments=[
+            {
+                "filename": "report.pdf",
+                "mimeType": "application/pdf",
+                "attachmentId": "att1",
+            }
+        ],
+    )
+    mock_service = create_mock_service(
+        message,
+        attachments_data=[
+            {"data": base64.urlsafe_b64encode(b"%PDF-1.4").decode().rstrip("=")}
+        ],
+    )
+    mock_service.users().drafts().create().execute.return_value = {"id": "draft001"}
+
+    result = await _unwrap(draft_gmail_message)(
+        service=mock_service,
+        user_google_email="me@example.com",
+        forward_message_id="msgdraft",
+    )
+
+    assert "Draft created" in result
+    assert "draft001" in result
+    mock_service.users().messages().send().execute.assert_not_called()
+
+    draft_body = mock_service.users().drafts().create.call_args.kwargs["body"]
+    drafted = message_from_bytes(base64.urlsafe_b64decode(draft_body["message"]["raw"]))
+    assert drafted["Subject"] == "Fwd: Quarterly"
+    assert drafted["To"] is None
+    _, attachments = get_body_and_attachments(drafted)
+    assert [a.get_filename() for a in attachments] == ["report.pdf"]
+    assert attachments[0].get_payload(decode=True) == b"%PDF-1.4"

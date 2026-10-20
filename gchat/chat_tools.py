@@ -19,6 +19,7 @@ from mcp.types import ToolAnnotations
 # Auth & server utilities
 from auth.service_decorator import require_google_service, require_multiple_services
 from core.file_limits import FileTooLargeError, download_http_url_bytes
+from core.gcs_attachment_storage import gcs_files_enabled
 from core.server import server
 from core.utils import TransientNetworkError, UserInputError, handle_http_errors
 from gchat.chat_helpers import (
@@ -692,10 +693,10 @@ async def download_chat_attachment(
     size_bytes = len(file_bytes)
     size_kb = size_bytes / 1024
 
-    # Check if we're in stateless mode (can't save files)
+    # Stateless mode has no file storage unless GCS staging is configured.
     from auth.oauth_config import is_stateless_mode
 
-    if is_stateless_mode():
+    if is_stateless_mode() and not gcs_files_enabled():
         # 75 input bytes encode to at most 100 base64 characters; do not encode
         # the entire attachment merely to return a short preview.
         b64_preview = base64.urlsafe_b64encode(file_bytes[:75]).decode("utf-8")[:100]
@@ -714,8 +715,12 @@ async def download_chat_attachment(
     from core.config import get_transport_mode
 
     storage = get_attachment_storage()
-    result = storage.save_attachment_bytes(
-        file_bytes=file_bytes, filename=filename, mime_type=content_type
+    # The GCS backend uploads over the network, so keep it off the event loop.
+    result = await asyncio.to_thread(
+        storage.save_attachment_bytes,
+        file_bytes=file_bytes,
+        filename=filename,
+        mime_type=content_type,
     )
 
     result_lines = [
@@ -730,7 +735,7 @@ async def download_chat_attachment(
             "\nThe file has been saved to disk and can be accessed directly via the file path."
         )
     else:
-        download_url = get_attachment_url(result.file_id)
+        download_url = await asyncio.to_thread(get_attachment_url, result.file_id)
         result_lines.append(f"\nDownload URL: {download_url}")
         result_lines.append("\nThe file will expire after 1 hour.")
 

@@ -227,9 +227,10 @@ Create, rename, delete, or populate tabs from Markdown. Uses `action` to select 
 
 Headings (H1-H6), paragraphs, bold/italic/code inline, links, ordered
 and unordered lists, fenced code blocks, blockquotes, horizontal rules,
-and images rendered as linked alt text fallback.
+GFM pipe tables (native Docs tables with a bold header row), and images
+rendered as linked alt text fallback.
 
-Not yet supported: embedded image insertion (images rendered as linked alt text fallback only), tables (plain-text fallback), footnotes, smart chips, equations.
+Not yet supported: embedded image insertion (images rendered as linked alt text fallback only), tables inside blockquotes or lists, or over 20 columns or 1000 rows (plain-text rows), footnotes, smart chips, equations.
 
 **Example**
 

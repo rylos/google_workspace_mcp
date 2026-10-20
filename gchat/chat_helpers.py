@@ -23,6 +23,7 @@ _UNNAMED_SPACE_FALLBACKS = {
 _SPACE_NAME_MAX_MEMBERS = 3
 _PEOPLE_BATCH_SIZE = 200  # people.getBatchGet limit
 _MAX_CONSECUTIVE_MEMBER_LOOKUP_FAILURES = 2
+_SCOPE_ERROR_REASON = "ACCESS_TOKEN_SCOPE_INSUFFICIENT"
 _SEARCH_MESSAGES_RETRY_BASE_DELAY_SECONDS = 1
 
 
@@ -115,6 +116,14 @@ async def _lookup_people_names(people_service, user_ids: List[str]) -> Dict[str,
     return names
 
 
+def _is_scope_error(error: HttpError) -> bool:
+    """Return True when an HttpError carries an ACCESS_TOKEN_SCOPE_INSUFFICIENT detail."""
+    details = error.error_details
+    return isinstance(details, list) and any(
+        isinstance(d, dict) and d.get("reason") == _SCOPE_ERROR_REASON for d in details
+    )
+
+
 async def _list_memberships(chat_service, space_name: str) -> List[dict]:
     """Return every membership of a space, following nextPageToken."""
     memberships = []
@@ -171,7 +180,7 @@ async def _name_spaces(
         except HttpError as e:
             logger.debug(f"Could not list members of {space_name}: {e}")
             # Missing scope or throttling would fail every remaining space too.
-            if e.resp.status in (403, 429):
+            if e.resp.status == 429 or _is_scope_error(e):
                 break
             continue
         except Exception as e:

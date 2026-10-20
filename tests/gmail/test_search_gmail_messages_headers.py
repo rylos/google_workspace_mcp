@@ -380,7 +380,10 @@ async def test_batch_failure_falls_back_to_sequential(monkeypatch):
     service = _build_service(
         list_response=_list_response(["msg-1"]),
         message_responses={
-            ("msg-1", "metadata"): _metadata_response("msg-1"),
+            ("msg-1", "metadata"): {
+                **_metadata_response("msg-1"),
+                "labelIds": ["DRAFT"],
+            },
         },
         batch_factory=_broken_batch,
     )
@@ -389,3 +392,34 @@ async def test_batch_failure_falls_back_to_sequential(monkeypatch):
 
     assert "Subject: Example subject" in result
     assert "From: sender@example.com" in result
+    assert "Labels: DRAFT\n" in result
+
+
+@pytest.mark.asyncio
+async def test_include_headers_lists_labels_so_drafts_are_told_from_sent_mail():
+    draft = _metadata_response("m1")
+    draft["labelIds"] = ["DRAFT"]
+    sent = _metadata_response("m2")
+    sent["labelIds"] = ["SENT", "INBOX"]
+    service = _build_service(
+        list_response=_list_response(["m1", "m2"]),
+        message_responses={("m1", "metadata"): draft, ("m2", "metadata"): sent},
+    )
+
+    result = await _run_search(service, include_headers=True)
+
+    assert "Labels: DRAFT\n" in result
+    assert "Labels: SENT, INBOX\n" in result
+
+
+@pytest.mark.asyncio
+async def test_include_headers_without_label_ids_adds_no_labels_line():
+    service = _build_service(
+        list_response=_list_response(["m1"]),
+        message_responses={("m1", "metadata"): _metadata_response("m1")},
+    )
+
+    result = await _run_search(service, include_headers=True)
+
+    assert "Subject: Example subject" in result
+    assert "Labels:" not in result

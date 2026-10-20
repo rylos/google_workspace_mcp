@@ -40,6 +40,8 @@ _MIME_TO_EXTENSION = {
     "text/html": ".html",
 }
 
+_MAX_FILE_NAME_BYTES = 255
+
 _WINDOWS_RESERVED_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -85,7 +87,13 @@ def _build_save_name(
         # The full file_id, not a prefix: a truncated one lets two distinct
         # attachments land on the same path, silently overwriting the first.
         safe_filename = Path(sanitize_attachment_filename(filename))
-        return f"{safe_filename.stem}_{file_id}{safe_filename.suffix}"
+        tail = f"_{file_id}{safe_filename.suffix}"
+        if len(tail.encode()) >= _MAX_FILE_NAME_BYTES:
+            tail = f"_{file_id}"
+        budget = _MAX_FILE_NAME_BYTES - len(tail.encode())
+        # Drop any character split by the byte cut.
+        stem = safe_filename.stem.encode()[:budget].decode(errors="ignore")
+        return f"{stem}{tail}"
     return f"{file_id}{_MIME_TO_EXTENSION.get(mime_type or '', '')}"
 
 
@@ -383,7 +391,20 @@ _attachment_storage: Optional[AttachmentStorage] = None
 
 
 def get_attachment_storage() -> AttachmentStorage:
-    """Get the global attachment storage instance."""
+    """Get the global attachment storage instance.
+
+    Returns the GCS-backed storage instead of local disk when
+    ``WORKSPACE_MCP_FILES_GCS_BUCKET`` is set on an HTTP transport.
+    """
+    # core.gcs_attachment_storage imports this module, so import it lazily.
+    from core.gcs_attachment_storage import (
+        gcs_files_enabled,
+        get_gcs_attachment_storage,
+    )
+
+    if gcs_files_enabled():
+        return get_gcs_attachment_storage()
+
     global _attachment_storage
     if _attachment_storage is None:
         _attachment_storage = AttachmentStorage()
@@ -401,6 +422,14 @@ def get_attachment_url(file_id: str) -> str:
     Returns:
         Full URL to access the attachment
     """
+    from core.gcs_attachment_storage import (
+        gcs_files_enabled,
+        get_gcs_attachment_storage,
+    )
+
+    if gcs_files_enabled():
+        return get_gcs_attachment_storage().get_signed_url(file_id)
+
     from core.config import WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI
 
     # In stdio mode the attachment route is served by the lazily-started callback

@@ -338,3 +338,42 @@ def test_record_authenticated_user_never_raises_without_sdk(
     monkeypatch.setattr(builtins, "__import__", import_without_otel)
 
     telemetry.record_authenticated_user("alice@example.com")  # must not raise
+
+
+def test_record_google_principal_always_sets_auth_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(telemetry.USER_EMAIL_ATTRIBUTE_ENV, raising=False)
+    span = _FakeSpan()
+    _patch_current_span(monkeypatch, span)
+
+    telemetry.record_google_principal("service-account", "subject@example.com")
+
+    assert span.attributes == {"workspace_mcp.auth.mode": "service-account"}
+
+
+def test_record_google_principal_sets_principal_when_opted_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(telemetry.USER_EMAIL_ATTRIBUTE_ENV, "true")
+    span = _FakeSpan()
+    _patch_current_span(monkeypatch, span)
+
+    telemetry.record_google_principal("service-account", "subject@example.com")
+
+    assert span.attributes == {
+        "workspace_mcp.auth.mode": "service-account",
+        "workspace_mcp.google.principal": "subject@example.com",
+    }
+
+
+def test_record_google_principal_skips_non_recording_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(telemetry.USER_EMAIL_ATTRIBUTE_ENV, "true")
+    span = _FakeSpan(recording=False)
+    _patch_current_span(monkeypatch, span)
+
+    telemetry.record_google_principal("oauth2.1", "alice@example.com")
+
+    assert span.attributes == {}

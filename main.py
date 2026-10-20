@@ -8,6 +8,7 @@ import sys
 from functools import partial
 from importlib import metadata, import_module
 from typing import NoReturn
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from core.startup_ui import StartupDisplay, collapse_home, wordmark_lines
 
@@ -67,6 +68,9 @@ def _load_startup_dependencies():
     )
 
 
+dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(dotenv_path=dotenv_path)
+
 (
     get_selected_backend,
     get_credential_store,
@@ -89,16 +93,13 @@ def _load_startup_dependencies():
     filter_server_tools,
 ) = _load_startup_dependencies()
 
-dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-load_dotenv(dotenv_path=dotenv_path)
-
 # Suppress googleapiclient discovery cache warning
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 # Suppress httpx/httpcore INFO logs that leak access tokens in URLs
-# (e.g. tokeninfo?access_token=ya29.xxx)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+# (e.g. tokeninfo?access_token=ya29.xxx). FastMCP 4 uses the httpx2 fork.
+for _http_logger in ("httpx", "httpcore", "httpx2", "httpcore2"):
+    logging.getLogger(_http_logger).setLevel(logging.WARNING)
 
 reload_oauth_config()
 
@@ -127,6 +128,22 @@ logger = logging.getLogger(__name__)
 install_noisy_log_filters()
 configure_file_logging()
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _loopback_redirect_port(redirect_uri: str | None) -> int | None:
+    """Return the explicit port of an http loopback redirect URI, else None."""
+    if not redirect_uri:
+        return None
+    try:
+        parsed = urlparse(redirect_uri)
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != "http" or parsed.hostname not in _LOOPBACK_HOSTS:
+        return None
+    return port
+
 
 def resolve_stdio_callback_port() -> None:
     """
@@ -134,15 +151,35 @@ def resolve_stdio_callback_port() -> None:
 
     Streamable HTTP/OAuth 2.1 owns its main HTTP port directly and must keep the
     normal PORT/WORKSPACE_MCP_PORT semantics. The fallback range only exists for
-    the standalone stdio callback listener.
+    the standalone stdio callback listener, and only when no redirect URI pins it.
+    A busy port is logged rather than fatal because the listener binds lazily.
     """
     from auth.port_resolver import resolve_port, NoAvailablePortError, PortConfigError
 
+    redirect_uri = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
+    pinned_port = _loopback_redirect_port(redirect_uri)
+
     try:
-        resolve_port()
-    except (NoAvailablePortError, PortConfigError) as exc:
+        resolve_port(preferred=pinned_port, allow_fallback=not redirect_uri)
+    except PortConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+    except NoAvailablePortError as exc:
+        if pinned_port is None:
+            logger.warning(
+                "%s Continuing; OAuth re-authorization will fail until the port frees up.",
+                exc,
+            )
+            os.environ.pop("WORKSPACE_MCP_RESOLVED_PORT", None)
+        else:
+            logger.warning(
+                "OAuth callback port %d required by GOOGLE_OAUTH_REDIRECT_URI is in "
+                "use. Continuing; OAuth re-authorization will fail until the port "
+                "frees up or GOOGLE_OAUTH_REDIRECT_URI is changed.",
+                pinned_port,
+            )
+            os.environ["WORKSPACE_MCP_PORT"] = str(pinned_port)
+            os.environ["WORKSPACE_MCP_RESOLVED_PORT"] = "1"
     reload_oauth_config()
 
 
@@ -343,20 +380,21 @@ def _optional_field(name: str, *, path: bool = False) -> tuple[str, str, str]:
     return name, collapse_home(os.path.expanduser(value)) if path else value, "on"
 
 
-def _flag_field(name: str, *, warn_when_true: bool = False) -> tuple[str, str, str]:
-    """Describe a boolean env var as a (label, value, state) display row."""
-    value = os.getenv(name, "false")
-    if value.strip().lower() not in {"true", "1", "yes"}:
-        return name, value, "off"
-    return name, value, "warn" if warn_when_true else "on"
+def _mode_field(
+    label: str, env_var: str, enabled: bool, *, warn_when_on: bool = False
+) -> tuple[str, str, str]:
+    """Describe a resolved mode as a (label, value, state) row naming its env var."""
+    if not enabled:
+        return label, f"off · {env_var}", "off"
+    return label, f"on  · {env_var}", "warn" if warn_when_on else "on"
 
 
 def _disabled_tools_field(disabled_tools: set[str]) -> tuple[str, str, str]:
     """Describe the resolved per-tool block list as a display row."""
-    name = "WORKSPACE_MCP_DISABLED_TOOLS"
+    env_var = "WORKSPACE_MCP_DISABLED_TOOLS"
     if not disabled_tools:
-        return name, "not set", "off"
-    return name, ", ".join(sorted(disabled_tools)), "on"
+        return "Disabled tools", f"none · {env_var}", "off"
+    return "Disabled tools", f"{', '.join(sorted(disabled_tools))} · {env_var}", "on"
 
 
 def _client_secret_field() -> tuple[str, str, str]:
@@ -400,14 +438,29 @@ def describe_credential_config() -> list[tuple[str, str, str]]:
 
 
 def describe_mode_config(
-    disabled_tools: set[str] = frozenset(),
+    disabled_tools: set[str] = frozenset(), *, single_user: bool = False
 ) -> list[tuple[str, str, str]]:
-    """Build the mode rows shown in the startup configuration section."""
+    """Build the mode rows shown in the startup configuration section.
+
+    Rows report the modes the server resolved, not a re-parse of the env vars,
+    so the banner cannot disagree with how the server actually runs.
+    """
+    config = get_oauth_config()
     return [
-        _flag_field("MCP_SINGLE_USER_MODE"),
-        _flag_field("MCP_ENABLE_OAUTH21"),
-        _flag_field("WORKSPACE_MCP_STATELESS_MODE"),
-        _flag_field("OAUTHLIB_INSECURE_TRANSPORT", warn_when_true=True),
+        _mode_field("OAuth 2.1", "MCP_ENABLE_OAUTH21", config.is_oauth21_enabled()),
+        _mode_field("Stateless", "WORKSPACE_MCP_STATELESS_MODE", config.stateless_mode),
+        _mode_field(
+            "Single-user",
+            "MCP_SINGLE_USER_MODE",
+            single_user or os.getenv("MCP_SINGLE_USER_MODE") == "1",
+        ),
+        # oauthlib treats any non-empty value as enabled, "false" included.
+        _mode_field(
+            "Insecure transport",
+            "OAUTHLIB_INSECURE_TRANSPORT",
+            bool(os.getenv("OAUTHLIB_INSECURE_TRANSPORT")),
+            warn_when_on=True,
+        ),
         _disabled_tools_field(disabled_tools),
     ]
 
@@ -498,6 +551,8 @@ def main():
             "Example: --permissions gmail:organize drive:readonly. "
             "Gmail levels: readonly, organize, drafts, send, full (cumulative). "
             "Other services: readonly, full. "
+            "Join levels with '+' to grant only the scopes each named level adds "
+            "(e.g. gmail:readonly+send). "
             "Mutually exclusive with --read-only and --tools."
         ),
     )
@@ -676,7 +731,10 @@ def main():
     ui.fields(
         [
             ("Credentials", describe_credential_config()),
-            ("Modes", describe_mode_config(disabled_tools)),
+            (
+                "Modes",
+                describe_mode_config(disabled_tools, single_user=args.single_user),
+            ),
         ]
     )
 

@@ -6,7 +6,9 @@ from auth.oauth_proxy_config import (
     MAX_OAUTH_TOKEN_EXPIRY_THRESHOLD_SECONDS,
     OAUTH_ACCESS_TOKEN_EXPIRY_ENV,
     OAUTH_REFRESH_TOKEN_EXPIRY_ENV,
+    OAUTH_REQUIRE_CONSENT_ENV,
     OAUTH_TOKEN_EXPIRY_THRESHOLD_ENV,
+    get_oauth_proxy_consent_kwargs,
     get_oauth_proxy_expiry_kwargs,
 )
 
@@ -94,3 +96,40 @@ def test_token_expiry_env_accepts_safe_limit_boundaries(monkeypatch):
         "fastmcp_access_token_expiry_seconds": 2_592_000,
         "fallback_refresh_token_expiry_seconds": 31_536_000,
     }
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_consent_env_unset_leaves_fastmcp_default(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv(OAUTH_REQUIRE_CONSENT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(OAUTH_REQUIRE_CONSENT_ENV, value)
+
+    assert get_oauth_proxy_consent_kwargs() == {}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("always", True),
+        ("ALWAYS", True),
+        ("remember", "remember"),
+        (" Remember ", "remember"),
+    ],
+)
+def test_consent_env_maps_to_the_provider_kwarg(monkeypatch, value, expected):
+    monkeypatch.setenv(OAUTH_REQUIRE_CONSENT_ENV, value)
+
+    assert get_oauth_proxy_consent_kwargs() == {
+        "require_authorization_consent": expected
+    }
+
+
+@pytest.mark.parametrize(
+    "value", ["rememberr", "never", "false", "0", "external", "true"]
+)
+def test_consent_env_rejects_unsupported_values(monkeypatch, value):
+    monkeypatch.setenv(OAUTH_REQUIRE_CONSENT_ENV, value)
+
+    with pytest.raises(ValueError, match=OAUTH_REQUIRE_CONSENT_ENV):
+        get_oauth_proxy_consent_kwargs()

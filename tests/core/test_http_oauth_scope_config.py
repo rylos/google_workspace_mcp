@@ -2,6 +2,10 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.google import GoogleProvider
+from key_value.aio.stores.memory import MemoryStore
+from starlette.testclient import TestClient
 
 import core.server as server_module
 
@@ -85,7 +89,7 @@ def test_configure_server_for_http_uses_protocol_auth_required_scopes(monkeypatc
             self._cimd_manager = SimpleNamespace(default_scope=default_scope)
 
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
-    monkeypatch.setattr(server_module, "GoogleProvider", FakeGoogleProvider)
+    monkeypatch.setattr(server_module, "WorkspaceGoogleProvider", FakeGoogleProvider)
     monkeypatch.setattr(
         server_module,
         "get_current_scopes",
@@ -152,7 +156,7 @@ def test_configure_server_for_http_rejects_google_provider_without_client_secret
         "this-is-a-long-enough-jwt-signing-key",
     )
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
-    monkeypatch.setattr(server_module, "GoogleProvider", object)
+    monkeypatch.setattr(server_module, "WorkspaceGoogleProvider", object)
     monkeypatch.setattr(server_module, "set_auth_provider", lambda provider: None)
     monkeypatch.setattr(server_module, "_auth_provider", server_module._auth_provider)
     monkeypatch.setattr(server_module.server, "auth", server_module.server.auth)
@@ -216,7 +220,7 @@ def test_configure_server_for_http_accepts_client_secret_from_file(
             self.client_registration_options = None
 
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
-    monkeypatch.setattr(server_module, "GoogleProvider", FakeGoogleProvider)
+    monkeypatch.setattr(server_module, "WorkspaceGoogleProvider", FakeGoogleProvider)
     monkeypatch.setattr(
         server_module,
         "get_current_scopes",
@@ -246,7 +250,7 @@ def test_configure_server_for_http_rejects_external_provider_without_jwt_key(
 ):
     monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
-    monkeypatch.setattr(server_module, "GoogleProvider", object)
+    monkeypatch.setattr(server_module, "WorkspaceGoogleProvider", object)
     monkeypatch.setattr(server_module, "set_auth_provider", lambda provider: None)
     monkeypatch.setattr(server_module, "_auth_provider", server_module._auth_provider)
     monkeypatch.setattr(server_module.server, "auth", server_module.server.auth)
@@ -377,6 +381,49 @@ def test_configure_server_for_http_passes_expiry_config_to_external_provider(
     assert captured["fallback_refresh_token_expiry_seconds"] == 2592000
 
 
+TOOL_CHALLENGE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid",
+]
+
+
+def _make_workspace_google_provider():
+    return server_module.WorkspaceGoogleProvider(
+        client_id="client-id",
+        client_secret="client-secret",
+        base_url="https://workspace-mcp.example.test",
+        client_storage=MemoryStore(),
+        jwt_signing_key="test-signing-key",
+        required_scopes=sorted(server_module.PROTOCOL_AUTH_SCOPES),
+        valid_scopes=TOOL_CHALLENGE_SCOPES,
+    )
+
+
+def test_google_provider_challenges_with_tool_scopes():
+    """The 401 challenge must name the tool scopes, not just identity (#1116)."""
+    provider = _make_workspace_google_provider()
+
+    assert provider.get_challenge_scopes() == TOOL_CHALLENGE_SCOPES
+    assert provider.get_challenge_scopes(["openid"]) == ["openid"]
+
+
+@pytest.mark.skipif(
+    not hasattr(GoogleProvider, "challenge_scopes"),
+    reason="WWW-Authenticate scope challenge requires FastMCP 4",
+)
+def test_unauthenticated_request_challenges_with_tool_scopes():
+    app = FastMCP("test", auth=_make_workspace_google_provider()).http_app()
+
+    response = TestClient(app).post("/mcp", json={})
+
+    assert response.status_code == 401
+    assert (
+        f'scope="{" ".join(TOOL_CHALLENGE_SCOPES)}"'
+        in (response.headers["www-authenticate"])
+    )
+
+
 def test_configure_server_for_http_passes_token_validation_settings(monkeypatch):
     captured = {}
 
@@ -413,3 +460,44 @@ def test_configure_server_for_http_passes_token_validation_settings(monkeypatch)
 
     assert captured["token_validation_workers"] == 32
     assert captured["token_validation_cache_ttl"] == 45
+
+
+def test_configure_server_for_http_passes_consent_mode_to_google_provider(monkeypatch):
+    captured = {}
+
+    class FakeGoogleProvider:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.client_registration_options = SimpleNamespace(default_scopes=None)
+            self._default_scope_str = ""
+            self._cimd_manager = SimpleNamespace(default_scope="")
+
+    monkeypatch.setenv("WORKSPACE_MCP_OAUTH_PROXY_REQUIRE_CONSENT", "remember")
+    monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
+    monkeypatch.setattr(server_module, "WorkspaceGoogleProvider", FakeGoogleProvider)
+    monkeypatch.setattr(server_module, "set_auth_provider", lambda provider: None)
+    monkeypatch.setattr(server_module, "get_oauth_proxy_expiry_kwargs", lambda: {})
+    monkeypatch.setattr(
+        server_module,
+        "get_current_scopes",
+        lambda: ["https://www.googleapis.com/auth/userinfo.email", "openid"],
+    )
+    monkeypatch.setattr(server_module, "_auth_provider", server_module._auth_provider)
+    monkeypatch.setattr(server_module.server, "auth", server_module.server.auth)
+    monkeypatch.setattr(
+        "auth.oauth_config.get_oauth_config",
+        lambda: SimpleNamespace(
+            is_oauth21_enabled=lambda: True,
+            is_configured=lambda: True,
+            is_public_client=lambda: False,
+            is_external_oauth21_provider=lambda: False,
+            client_id="client-id",
+            client_secret="client-secret",
+            get_oauth_base_url=lambda: "https://workspace-mcp.example.test",
+            redirect_path="/oauth2callback",
+        ),
+    )
+
+    server_module.configure_server_for_http()
+
+    assert captured["require_authorization_consent"] == "remember"

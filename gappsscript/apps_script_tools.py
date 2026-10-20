@@ -507,44 +507,37 @@ async def _run_script_function_impl(
     if parameters:
         request_body["parameters"] = parameters
 
-    try:
+    if not deployment_id:
+        deployment_id = await _resolve_execution_deployment_id(service, script_id)
         if not deployment_id:
-            deployment_id = await _resolve_execution_deployment_id(service, script_id)
-            if not deployment_id:
-                return (
-                    "Execution failed\n"
-                    f"Function: {function_name}\n"
-                    "Error: No versioned API Executable deployment was found. In the "
-                    "Apps Script editor, use Deploy > New deployment > API Executable. "
-                    "The script and caller must share a standard Google Cloud project. "
-                    "manage_deployment(action='create') is sufficient only when the "
-                    "script manifest already defines executionApi."
-                )
-
-        response = await asyncio.to_thread(
-            service.scripts().run(scriptId=deployment_id, body=request_body).execute
-        )
-
-        if "error" in response:
-            error_details = response["error"]
-            error_message = error_details.get("message", "Unknown error")
             return (
-                f"Execution failed\nFunction: {function_name}\nError: {error_message}"
+                "Execution failed\n"
+                f"Function: {function_name}\n"
+                "Error: No versioned API Executable deployment was found. In the "
+                "Apps Script editor, use Deploy > New deployment > API Executable. "
+                "The script and caller must share a standard Google Cloud project. "
+                "manage_deployment(action='create') is sufficient only when the "
+                "script manifest already defines executionApi."
             )
 
-        result = response.get("response", {}).get("result")
-        output = [
-            "Execution successful",
-            f"Function: {function_name}",
-            f"Result: {result}",
-        ]
+    response = await asyncio.to_thread(
+        service.scripts().run(scriptId=deployment_id, body=request_body).execute
+    )
 
-        logger.info(f"[run_script_function] Successfully executed {function_name}")
-        return "\n".join(output)
+    if "error" in response:
+        error_details = response["error"]
+        error_message = error_details.get("message", "Unknown error")
+        return f"Execution failed\nFunction: {function_name}\nError: {error_message}"
 
-    except Exception as e:
-        logger.error(f"[run_script_function] Execution error: {str(e)}")
-        return f"Execution failed\nFunction: {function_name}\nError: {str(e)}"
+    result = response.get("response", {}).get("result")
+    output = [
+        "Execution successful",
+        f"Function: {function_name}",
+        f"Result: {result}",
+    ]
+
+    logger.info(f"[run_script_function] Successfully executed {function_name}")
+    return "\n".join(output)
 
 
 async def _resolve_execution_deployment_id(
@@ -847,20 +840,28 @@ async def _update_deployment_impl(
         f"[update_deployment] Email: {user_google_email}, Script: {script_id}, Deployment: {deployment_id}"
     )
 
-    deployment_config: Dict[str, Any] = {"scriptId": script_id}
-    if version_number is not None:
-        deployment_config["versionNumber"] = version_number
-    if description:
-        deployment_config["description"] = description
+    async with _get_script_update_lock(script_id):
+        current = await asyncio.to_thread(
+            service.projects()
+            .deployments()
+            .get(scriptId=script_id, deploymentId=deployment_id)
+            .execute
+        )
+        deployment_config: Dict[str, Any] = dict(current.get("deploymentConfig") or {})
+        deployment_config["scriptId"] = script_id
+        if version_number is not None:
+            deployment_config["versionNumber"] = version_number
+        if description and description.strip():
+            deployment_config["description"] = description
 
-    request_body = {"deploymentConfig": deployment_config}
+        request_body = {"deploymentConfig": deployment_config}
 
-    deployment = await asyncio.to_thread(
-        service.projects()
-        .deployments()
-        .update(scriptId=script_id, deploymentId=deployment_id, body=request_body)
-        .execute
-    )
+        deployment = await asyncio.to_thread(
+            service.projects()
+            .deployments()
+            .update(scriptId=script_id, deploymentId=deployment_id, body=request_body)
+            .execute
+        )
 
     deployment_config_resp = deployment.get("deploymentConfig", {})
     resolved_version = deployment_config_resp.get("versionNumber", version_number)

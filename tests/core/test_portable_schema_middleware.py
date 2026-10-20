@@ -5,8 +5,10 @@ from typing import Literal, Optional
 
 import pytest
 from fastmcp import Client, FastMCP
+from pydantic import TypeAdapter, ValidationError
 
 # Importing the tool modules registers their tools on the shared server.
+import gappsscript.apps_script_tools  # noqa: F401
 import gcalendar.calendar_tools  # noqa: F401
 import gchat.chat_tools  # noqa: F401
 import gcontacts.contacts_tools  # noqa: F401
@@ -131,14 +133,14 @@ async def test_listed_schema_is_portable_and_optional_args_still_work():
             "search", {"query": "q", "page_token": None}
         )
 
-    properties = tool.inputSchema["properties"]
+    properties = tool.input_schema["properties"]
     assert properties["page_token"] == {"type": "string", "default": None}
     assert properties["search_type"] == {
         "type": "string",
         "enum": ["image"],
         "default": None,
     }
-    assert tool.inputSchema["required"] == ["query"]
+    assert tool.input_schema["required"] == ["query"]
     assert json.loads(omitted.content[0].text) == ["q", None, None]
     assert json.loads(explicit_null.content[0].text) == ["q", None, None]
 
@@ -151,3 +153,20 @@ async def test_registered_catalog_has_no_unportable_keywords():
     }
 
     assert {name: path for name, path in offenders.items() if path} == {}
+
+
+@pytest.mark.asyncio
+async def test_registered_null_default_args_accept_explicit_null():
+    rejected = []
+    for tool in await server.list_tools():
+        # Its default is USER_GOOGLE_EMAIL, which is None only when that is unset.
+        if tool.name == "start_google_auth":
+            continue
+        for name, prop in tool.parameters.get("properties", {}).items():
+            if "default" not in prop or prop["default"] is not None:
+                continue
+            try:
+                TypeAdapter(tool.fn.__annotations__[name]).validate_python(None)
+            except ValidationError:
+                rejected.append(f"{tool.name}.{name}")
+    assert rejected == []

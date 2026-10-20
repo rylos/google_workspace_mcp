@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from typing import get_type_hints
 from unittest.mock import AsyncMock, Mock, call, patch
 
@@ -24,6 +25,7 @@ from pydantic import TypeAdapter
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from core.utils import UserInputError
+import auth.google_auth as google_auth
 import auth.service_decorator as service_decorator
 
 # Import the internal implementation functions (not the decorated ones)
@@ -701,6 +703,46 @@ async def test_list_deployments_head_deployment_has_no_version():
 
 
 @pytest.mark.asyncio
+async def test_update_deployment_preserves_unspecified_config_fields():
+    mock_service = Mock()
+    mock_service.projects().deployments().get().execute.return_value = {
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 6,
+            "manifestFileName": "appsscript",
+            "description": "Old description",
+        }
+    }
+    mock_service.projects().deployments().update().execute.return_value = {
+        "deploymentId": "deploy123",
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 6,
+            "manifestFileName": "appsscript",
+            "description": "New description",
+        },
+    }
+
+    await _update_deployment_impl(
+        service=mock_service,
+        user_google_email="test@example.com",
+        script_id="test123",
+        deployment_id="deploy123",
+        description="New description",
+    )
+
+    _, update_kwargs = mock_service.projects().deployments().update.call_args
+    assert update_kwargs["body"] == {
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 6,
+            "manifestFileName": "appsscript",
+            "description": "New description",
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_update_deployment():
     """Test updating deployment wraps fields in deploymentConfig (issue #836)."""
     mock_service = Mock()
@@ -712,6 +754,9 @@ async def test_update_deployment():
         },
     }
 
+    mock_service.projects().deployments().get().execute.return_value = {
+        "deploymentConfig": {"scriptId": "test123", "manifestFileName": "appsscript"}
+    }
     mock_service.projects().deployments().update().execute.return_value = mock_response
 
     result = await _update_deployment_impl(
@@ -730,6 +775,7 @@ async def test_update_deployment():
     assert update_kwargs["body"] == {
         "deploymentConfig": {
             "scriptId": "test123",
+            "manifestFileName": "appsscript",
             "description": "Updated description",
         }
     }
@@ -752,6 +798,13 @@ async def test_update_deployment_with_version_number():
         },
     }
 
+    mock_service.projects().deployments().get().execute.return_value = {
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 1,
+            "manifestFileName": "appsscript",
+        }
+    }
     mock_service.projects().deployments().update().execute.return_value = mock_response
 
     result = await _update_deployment_impl(
@@ -768,12 +821,80 @@ async def test_update_deployment_with_version_number():
         "deploymentConfig": {
             "scriptId": "test123",
             "versionNumber": 2,
+            "manifestFileName": "appsscript",
             "description": "v2 - updated layout",
         }
     }
 
     assert "Version: 2" in result
     assert "v2 - updated layout" in result
+
+
+@pytest.mark.asyncio
+async def test_update_deployment_preserves_description_when_blank():
+    """Blank descriptions leave the existing deployment description intact."""
+    mock_service = Mock()
+    mock_service.projects().deployments().get().execute.return_value = {
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 1,
+            "manifestFileName": "appsscript",
+            "description": "Production",
+        }
+    }
+    mock_service.projects().deployments().update().execute.return_value = {
+        "deploymentId": "deploy123",
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 2,
+            "manifestFileName": "appsscript",
+            "description": "Production",
+        },
+    }
+
+    await _update_deployment_impl(
+        service=mock_service,
+        user_google_email="test@example.com",
+        script_id="test123",
+        deployment_id="deploy123",
+        description="   ",
+        version_number=2,
+    )
+
+    _, update_kwargs = mock_service.projects().deployments().update.call_args
+    assert update_kwargs["body"]["deploymentConfig"]["description"] == "Production"
+
+
+@pytest.mark.asyncio
+async def test_update_deployment_orders_concurrent_updates_for_same_script():
+    """A later update must read the config after an earlier update lands."""
+    config = {"scriptId": "test123", "versionNumber": 1, "description": "Old"}
+
+    def read_config():
+        snapshot = dict(config)
+        time.sleep(0.05)
+        return {"deploymentConfig": snapshot}
+
+    def write_config(scriptId, deploymentId, body):
+        config.clear()
+        config.update(body["deploymentConfig"])
+        return Mock(execute=Mock(return_value=body))
+
+    mock_service = Mock()
+    deployments = mock_service.projects.return_value.deployments.return_value
+    deployments.get.return_value.execute.side_effect = read_config
+    deployments.update.side_effect = write_config
+
+    await asyncio.gather(
+        _update_deployment_impl(
+            mock_service, "test@example.com", "test123", "deploy123", "New"
+        ),
+        _update_deployment_impl(
+            mock_service, "test@example.com", "test123", "deploy123", None, 2
+        ),
+    )
+
+    assert config == {"scriptId": "test123", "versionNumber": 2, "description": "New"}
 
 
 @pytest.mark.asyncio
@@ -786,6 +907,13 @@ async def test_manage_deployment_update_allows_version_number_without_descriptio
             "scriptId": "test123",
             "versionNumber": 2,
         },
+    }
+    mock_service.projects().deployments().get().execute.return_value = {
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 1,
+            "manifestFileName": "appsscript",
+        }
     }
     mock_service.projects().deployments().update().execute.return_value = mock_response
 
@@ -804,6 +932,7 @@ async def test_manage_deployment_update_allows_version_number_without_descriptio
         "deploymentConfig": {
             "scriptId": "test123",
             "versionNumber": 2,
+            "manifestFileName": "appsscript",
         }
     }
     assert "Version: 2" in result
@@ -1584,7 +1713,8 @@ async def test_project_actions_authenticate_only_required_service(
     assert authenticate.call_args.args[1] == service_type
     assert authenticate.call_args.args[5] == service_decorator._resolve_scopes(scopes)
     assert impl.call_args.args[:2] == (service, "u@e.com")
-    service.close.assert_called_once()
+    service.close.assert_not_called()
+    assert google_auth._idle_http[-1][1] is service._http.http
 
 
 @pytest.mark.asyncio

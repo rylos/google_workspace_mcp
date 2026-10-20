@@ -156,12 +156,13 @@ Add or remove labels on a single message.
 | remove_label_ids | array of strings | no | | Label IDs to remove |
 
 ### batch_modify_gmail_message_labels
-Add or remove labels on multiple messages at once.
+Add or remove labels on multiple messages, or on every message of whole threads, at once.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
-| message_ids | array of strings | yes | | |
+| message_ids | array of strings | one of | | Message IDs |
+| thread_ids | array of strings | one of | | Thread IDs; changes every message in each thread |
 | add_label_ids | array of strings | no | | Label IDs to add |
 | remove_label_ids | array of strings | no | | Label IDs to remove |
 

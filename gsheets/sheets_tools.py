@@ -27,6 +27,7 @@ from gsheets.sheets_helpers import (
     _column_to_index,
     _build_boolean_rule,
     _build_gradient_rule,
+    _build_merge_request,
     _fetch_cell_formulas,
     _fetch_detailed_sheet_errors,
     _fetch_grid_metadata,
@@ -35,7 +36,9 @@ from gsheets.sheets_helpers import (
     _format_conditional_rules_section,
     _format_named_ranges_list,
     _format_sheet_error_section,
+    _insert_cell_comment,
     _normalize_chips_input,
+    _normalize_merge_type,
     _parse_a1_range,
     _parse_condition_values,
     _parse_gradient_points,
@@ -654,11 +657,13 @@ async def _format_sheet_range_impl(
     bold: Optional[bool] = None,
     italic: Optional[bool] = None,
     font_size: Optional[int] = None,
-) -> str:
+    merge_cells: Optional[bool] = None,
+    merge_type: Optional[str] = None,
+) -> dict:
     """Internal implementation for format_sheet_range.
 
     Applies formatting to a Google Sheets range including colors, number formats,
-    text wrapping, alignment, and text styling.
+    text wrapping, alignment, text styling, and cell merging/unmerging.
 
     Args:
         service: Google Sheets API service client.
@@ -674,6 +679,8 @@ async def _format_sheet_range_impl(
         bold: Whether to apply bold formatting.
         italic: Whether to apply italic formatting.
         font_size: Font size in points.
+        merge_cells: True merges the range, False unmerges it.
+        merge_type: MERGE_ALL (default), MERGE_COLUMNS, or MERGE_ROWS; implies a merge.
 
     Returns:
         Dictionary with keys: range_name, spreadsheet_id, summary.
@@ -690,14 +697,18 @@ async def _format_sheet_range_impl(
             bold is not None,
             italic is not None,
             font_size is not None,
+            merge_cells is not None,
+            merge_type is not None,
         ]
     )
     if not has_any_format:
         raise UserInputError(
-            "Provide at least one formatting option (background_color, text_color, "
+            "Provide at least one formatting or merge option (background_color, text_color, "
             "number_format_type, wrap_strategy, horizontal_alignment, vertical_alignment, "
-            "bold, italic, or font_size)."
+            "bold, italic, font_size, merge_cells, or merge_type)."
         )
+
+    normalized_merge_type = _normalize_merge_type(merge_cells, merge_type)
 
     # Parse colors
     bg_color_parsed = _parse_hex_color(background_color)
@@ -821,14 +832,9 @@ async def _format_sheet_range_impl(
         user_entered_format["verticalAlignment"] = v_align_normalized
         fields.append("userEnteredFormat.verticalAlignment")
 
-    if not user_entered_format:
-        raise UserInputError(
-            "No formatting applied. Verify provided formatting options."
-        )
-
-    # Build and execute request
-    request_body = {
-        "requests": [
+    requests = []
+    if user_entered_format:
+        requests.append(
             {
                 "repeatCell": {
                     "range": grid_range,
@@ -836,8 +842,21 @@ async def _format_sheet_range_impl(
                     "fields": ",".join(fields),
                 }
             }
-        ]
-    }
+        )
+    if normalized_merge_type:
+        requests.append(
+            _build_merge_request(grid_range, range_name, normalized_merge_type)
+        )
+    elif merge_cells is False:
+        requests.append({"unmergeCells": {"range": grid_range}})
+
+    if not requests:
+        raise UserInputError(
+            "No formatting or merge action applied. Verify provided options."
+        )
+
+    # Build and execute request
+    request_body = {"requests": requests}
 
     await asyncio.to_thread(
         service.spreadsheets()
@@ -868,6 +887,10 @@ async def _format_sheet_range_impl(
         applied_parts.append("italic" if italic else "not italic")
     if font_size is not None:
         applied_parts.append(f"font size {font_size}")
+    if normalized_merge_type:
+        applied_parts.append(f"merged cells ({normalized_merge_type})")
+    elif merge_cells is False:
+        applied_parts.append("unmerged cells")
 
     summary = ", ".join(applied_parts)
 
@@ -883,7 +906,7 @@ async def _format_sheet_range_impl(
     title="Format Sheet Range",
     annotations=ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=False,
         openWorldHint=True,
     ),
@@ -905,10 +928,12 @@ async def format_sheet_range(
     bold: Optional[bool] = None,
     italic: Optional[bool] = None,
     font_size: Optional[int] = None,
+    merge_cells: Optional[bool] = None,
+    merge_type: Optional[str] = None,
 ) -> str:
     """
     Applies formatting to a range: colors, number formats, text wrapping,
-    alignment, and text styling.
+    alignment, text styling, and cell merging/unmerging.
 
     Colors accept hex strings (#RRGGBB). Number formats follow Sheets types
     (e.g., NUMBER, CURRENCY, DATE, PERCENT). If no sheet name is provided,
@@ -932,6 +957,10 @@ async def format_sheet_range(
         bold (Optional[bool]): Whether to apply bold formatting.
         italic (Optional[bool]): Whether to apply italic formatting.
         font_size (Optional[int]): Font size in points.
+        merge_cells (Optional[bool]): True merges the range, False unmerges it.
+            Merging keeps only the top-left value of each merged group.
+        merge_type (Optional[str]): MERGE_ALL (default), MERGE_COLUMNS, or
+            MERGE_ROWS. Setting it implies merge_cells=True.
 
     Returns:
         str: Confirmation of the applied formatting.
@@ -957,6 +986,8 @@ async def format_sheet_range(
         bold=bold,
         italic=italic,
         font_size=font_size,
+        merge_cells=merge_cells,
+        merge_type=merge_type,
     )
 
     # Build confirmation message with user email
@@ -3043,7 +3074,9 @@ async def manage_named_range(
 
 
 # Create comment management tools for sheets
-_comment_tools = create_comment_tools("spreadsheet", "spreadsheet_id")
+_comment_tools = create_comment_tools(
+    "spreadsheet", "spreadsheet_id", insert_cell_comment=_insert_cell_comment
+)
 
 # Extract and register the functions
 list_spreadsheet_comments = _comment_tools["list_comments"]

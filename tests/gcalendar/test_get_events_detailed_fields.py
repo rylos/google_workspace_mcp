@@ -106,6 +106,9 @@ all_get_paths = pytest.mark.parametrize(
     [_ranged_basic, _single_basic, _ranged_detail, _single_detail],
     ids=["ranged-basic", "single-basic", "ranged-detailed", "single-detailed"],
 )
+basic_branches = pytest.mark.parametrize(
+    "read", [_ranged_basic, _single_basic], ids=["ranged", "single"]
+)
 
 RECURRING_INSTANCE = {
     "id": "evt123_20260406T090000Z",
@@ -260,6 +263,25 @@ async def test_basic_ranged_output_is_unchanged():
 
     assert "Color ID" not in result
     assert "Recurring Event ID" not in result
+    assert "Status:" not in result
+
+
+@pytest.mark.asyncio
+@basic_branches
+async def test_basic_output_surfaces_cancelled_status(read):
+    """A cancelled event must not read like a live one in compact output."""
+    result = await read({**ORDINARY_MEETING, "status": "cancelled"})
+
+    assert "Status: cancelled" in result
+
+
+@pytest.mark.asyncio
+@basic_branches
+async def test_basic_output_omits_tentative_status(read):
+    """Only cancellation is surfaced; tentative events are still real meetings."""
+    result = await read({**ORDINARY_MEETING, "status": "tentative"})
+
+    assert "Status:" not in result
 
 
 @pytest.mark.asyncio
